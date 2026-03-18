@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cassandra - Mission Control</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/addons/p5.sound.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div id="ui-overlay">
+        <!-- Top Panels -->
+        <div id="top-panels">
+            <div class="glass-panel" id="panel-decisions">
+                <h2>Decisions</h2>
+                <div class="panel-content" id="decisions-content"></div>
+            </div>
+            <div class="glass-panel" id="panel-risks">
+                <h2>Risks</h2>
+                <div class="panel-content" id="risks-content"></div>
+            </div>
+            <div class="glass-panel" id="panel-topics">
+                <h2>Topics</h2>
+                <div class="panel-content" id="topics-content"></div>
+            </div>
+            <div class="glass-panel" id="panel-memory">
+                <h2>Memory Recall</h2>
+                <div class="panel-content" id="memory-content"></div>
+            </div>
+        </div>
+
+        <!-- Middle Command Area -->
+        <div id="middle-area">
+            <div id="agent-command">
+                <select id="agent-mode-select">
+                    <option value="GENERAL">General Mode</option>
+                    <option value="MARKETING">Marketing Mode</option>
+                    <option value="GROWTH">Growth Mode</option>
+                    <option value="OPS">Ops Mode</option>
+                    <option value="TECH">Tech Mode</option>
+                </select>
+                <button id="recall-btn">Recall Memory</button>
+            </div>
+            <div id="orb-click-target"
+                style="pointer-events: auto; cursor: pointer; padding: 40px; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; transition: all 0.3s ease;">
+                <h1 id="status-text">SYSTEM DORMANT</h1>
+                <p id="sub-status">Click to initialize connection</p>
+            </div>
+        </div>
+
+        <!-- Bottom Transcript Panel -->
+        <div id="bottom-panel">
+            <div class="glass-panel" id="panel-transcript">
+                <h2>Live Transcript Stream</h2>
+                <div class="panel-content" id="transcript-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- p5 canvas -->
+    <script src="sketch.js"></script>
+    <script src="websocket.js"></script>
+</body>
+
+</html>
