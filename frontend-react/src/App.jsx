@@ -1,103 +1,281 @@
-import React, { useState } from 'react';
-import GrowthOrb from './components/GrowthOrb.legacy';
+/**
+ * App.jsx — CLEAN REBUILD
+ * 
+ * Key changes from original:
+ *   1. All callbacks passed to useAudioPipeline are stable (useCallback with minimal deps)
+ *   2. No inline arrow functions passed as hook props
+ *   3. Single start guard at both App level and hook level
+ *   4. Clean separation of concerns
+ */
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import CassandraOrb from './components/CassandraOrb';
 import CortexPanel from './components/CortexPanel';
 import LiveTranscript from './components/LiveTranscript';
+import RoleSelector from './components/RoleSelector';
+import MicSelector from './components/MicSelector';
 import { useAudioPipeline } from './hooks/useAudioPipeline';
+import { useOrbStore } from './stores/orbStore';
+import './App.css';
+
+const API_URL = import.meta.env.VITE_API_URL || '';
+
+const getCurrentDayName = () => {
+  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  return days[new Date().getDay()];
+};
 
 function App() {
+  // ── State ──
+  const [meetingId, setMeetingId] = useState(null);
   const [systemState, setSystemState] = useState('idle');
-  const [showTranscript, setShowTranscript] = useState(false);
-
-  // Realtime Live Feed state
+  const [currentRole, setCurrentRole] = useState('GENERAL');
+  const [roleConfig, setRoleConfig] = useState(null);
+  const [availableRoles, setAvailableRoles] = useState([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState(null);
   const [transcripts, setTranscripts] = useState([]);
   const [insights, setInsights] = useState([]);
+  const [isConnected, setIsConnected] = useState(false);
 
-  // Connect Audio Pipeline hook to state managers
-  const { startPipeline, stopPipeline } = useAudioPipeline({
-    onStateChange: setSystemState,
-    onTranscript: (msg) => {
-      // Accumulate text stream
-      setTranscripts(prev => [...prev, msg].slice(-20)); // Keep last 20
-    },
-    onInsight: (msg) => {
-      // Accumulate insights
-      setInsights(prev => [...prev, msg].slice(-10));
-    }
+  const setOrbState = useOrbStore((s) => s.setState);
+
+  // Guard against double-clicks
+  const isStartingRef = useRef(false);
+
+  // ── Stable Callbacks ──
+  // These MUST be wrapped in useCallback with minimal deps.
+  // Passing inline arrows to useAudioPipeline caused the original bug:
+  // inline arrow → new reference every render → hook deps change →
+  // cleanup effect fires → pipeline destroyed.
+
+  const handleStateChange = useCallback((state) => {
+    setSystemState(state);
+    // setOrbState is stable (from zustand), safe to call directly
+    useOrbStore.getState().setState(state);
+  }, []);
+
+  const handleTranscript = useCallback((msg) => {
+    setTranscripts((prev) => [...prev, msg].slice(-100));
+  }, []);
+
+  const handleInsight = useCallback((msg) => {
+    setInsights((prev) => [...prev, msg].slice(-50));
+  }, []);
+
+  const handleConnected = useCallback(() => {
+    setIsConnected(true);
+  }, []);
+
+  const handleDisconnected = useCallback(() => {
+    setIsConnected(false);
+  }, []);
+
+  const handleRoleUpdate = useCallback((role, config) => {
+    setCurrentRole(role);
+    setRoleConfig(config);
+  }, []);
+
+  // ── Audio Pipeline ──
+  const {
+    startPipeline,
+    stopPipeline,
+    switchRole: wsSwitchRole,
+    isConnecting,
+  } = useAudioPipeline({
+    onStateChange: handleStateChange,
+    onTranscript: handleTranscript,
+    onInsight: handleInsight,
+    onConnected: handleConnected,
+    onDisconnected: handleDisconnected,
+    onRoleUpdate: handleRoleUpdate,
+    selectedDeviceId,
   });
 
-  const handleAwaken = () => {
-    setShowTranscript(true);
-    startPipeline(); // Grabs Mic and connects WebSockets
-  };
+  // ── Fetch roles on mount ──
+  useEffect(() => {
+    fetch(`${API_URL}/api/roles`)
+      .then((r) => r.json())
+      .then((data) => setAvailableRoles(data.roles || []))
+      .catch(console.error);
+  }, []);
 
-  const handleSleep = () => {
-    stopPipeline(); // Tears down WebSockets
-    setShowTranscript(false);
-  };
+  // ── Start Meeting ──
+  const handleStartMeeting = useCallback(async () => {
+    // Double-click guard
+    if (isStartingRef.current) return;
+    isStartingRef.current = true;
 
-  // Connect Cortex Ingestion to Orb
-  const handleCortexIngest = () => {
-    setSystemState('thinking');
-    setTimeout(() => { if (systemState !== 'speaking') setSystemState('listening') }, 4000);
-  };
+    try {
+      const res = await fetch(`${API_URL}/api/meetings/new`, { method: 'POST' });
+      if (!res.ok) throw new Error(`Failed to create meeting: ${res.status}`);
 
+      const data = await res.json();
+      const id = data.meeting_id;
+
+      setMeetingId(id);
+      await startPipeline(id);
+    } catch (err) {
+      console.error('Failed to start meeting:', err);
+      isStartingRef.current = false;
+    }
+  }, [startPipeline]);
+
+  // ── End Meeting ──
+  const handleEndMeeting = useCallback(() => {
+    stopPipeline();
+    setMeetingId(null);
+    setTranscripts([]);
+    setInsights([]);
+    setIsConnected(false);
+    setSystemState('idle');
+    isStartingRef.current = false;
+  }, [stopPipeline]);
+
+  // ── Switch Role ──
+  const handleSwitchRole = useCallback((role) => {
+    if (!meetingId) return;
+    wsSwitchRole(role);
+  }, [meetingId, wsSwitchRole]);
+
+  // ── Mic Change ──
+  const handleMicChange = useCallback((device) => {
+    setSelectedDeviceId(device.deviceId);
+    console.log('Selected microphone:', device.label, device.deviceId);
+  }, []);
+
+  // ── Render ──
   return (
-    <div className="h-screen w-screen bg-black text-slate-200 overflow-hidden flex" style={{ position: 'relative' }}>
-      {/* Video Background */}
-      <video
-        autoPlay
-        loop
-        muted
-        playsInline
-        style={{
-          position: 'absolute',
-          top: 0,
-          left: 0,
-          width: '100%',
-          height: '100%',
-          objectFit: 'cover',
-          zIndex: 0,
-          opacity: 0.35,
-          pointerEvents: 'none',
-        }}
-      >
-        <source src="/bg-video.mov" type="video/mp4" />
-      </video>
+    <div className="app-container">
+      <div className="bg-grid" />
 
-      {/* Left Sidebar: The Cortex */}
-      <div style={{ position: 'relative', zIndex: 10 }}>
-        <CortexPanel onIngest={handleCortexIngest} insights={insights} />
-      </div>
+      {/* Left Sidebar */}
+      <CortexPanel
+        meetingId={meetingId}
+        transcripts={transcripts}
+        insights={insights}
+        isConnected={isConnected}
+        apiUrl={API_URL}
+      />
 
-      {/* Center: The Orb */}
-      <div className="flex-1 relative" style={{ zIndex: 10 }}>
-        <GrowthOrb />
+      {/* Main Content */}
+      <div className="main-content">
+        {/* Header */}
+        <header className="app-header">
+          <div className="logo">
+            <span className="logo-icon">◉</span>
+            <span>CASSANDRA</span>
+          </div>
 
-        {/* Floating Controls (Bottom Center) */}
-        <div className="absolute bottom-10 left-0 right-0 flex justify-center gap-4 z-30">
-          <button
-            onClick={handleSleep}
-            className="px-6 py-2 bg-slate-800/50 border border-slate-600 rounded-full backdrop-blur-sm hover:bg-slate-700 text-xs uppercase tracking-widest cursor-pointer"
-          >
-            Sleep
-          </button>
-          <button
-            onClick={handleAwaken}
-            className="px-6 py-2 bg-cyan-900/30 border border-cyan-500/50 text-cyan-400 rounded-full backdrop-blur-sm hover:bg-cyan-900/50 text-xs uppercase tracking-widest shadow-[0_0_15px_rgba(0,243,255,0.3)] cursor-pointer"
-          >
-            Awaken
-          </button>
+          <MicSelector onMicChange={handleMicChange} disabled={!!meetingId} />
+
+          {meetingId && (
+            <div className="meeting-info">
+              <span className="meeting-id">
+                Meeting: {meetingId.slice(0, 8)}...
+              </span>
+              <span
+                className={`connection-status ${
+                  isConnected ? 'connected' : 'disconnected'
+                }`}
+              >
+                {isConnected ? '● Live' : '○ Offline'}
+              </span>
+            </div>
+          )}
+        </header>
+
+        {/* The Orb */}
+        <div className="orb-container">
+          <OrbErrorBoundary>
+            <CassandraOrb />
+          </OrbErrorBoundary>
+
+          <div className="state-indicator">
+            <div className={`state-pill ${systemState}`}>
+              {systemState.toUpperCase()}
+            </div>
+            {currentRole !== 'GENERAL' && (
+              <div
+                className="role-pill"
+                style={{
+                  background: roleConfig?.color_scheme?.primary || '#00FFFF',
+                }}
+              >
+                {currentRole}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* Live Transcript (Overlay) */}
-        {showTranscript && (
-          <div className="absolute bottom-24 left-1/2 transform -translate-x-1/2 w-full max-w-4xl px-6 pointer-events-none">
-            <LiveTranscript transcripts={transcripts} />
-          </div>
+        {/* Bottom Controls */}
+        <div className="bottom-controls">
+          {!meetingId ? (
+            <button
+              onClick={handleStartMeeting}
+              disabled={isConnecting}
+              className="btn-awaken"
+            >
+              {isConnecting
+                ? 'Initializing...'
+                : `Start Meeting - ${getCurrentDayName()}`}
+            </button>
+          ) : (
+            <>
+              <RoleSelector
+                currentRole={currentRole}
+                roles={availableRoles}
+                onSwitch={handleSwitchRole}
+              />
+              <button onClick={handleEndMeeting} className="btn-end">
+                End Meeting
+              </button>
+            </>
+          )}
+        </div>
+
+        {/* Live Transcript */}
+        {meetingId && (
+          <LiveTranscript transcripts={transcripts} insights={insights} />
         )}
       </div>
     </div>
   );
+}
+
+// ── Error Boundary for the Orb ──
+// Prevents a THREE.js crash from killing the entire app.
+class OrbErrorBoundary extends React.Component {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error('[OrbErrorBoundary]', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div
+          style={{
+            width: '100%',
+            height: '400px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            color: '#00FFFF',
+            fontFamily: 'monospace',
+            fontSize: '14px',
+            opacity: 0.5,
+          }}
+        >
+          Orb render failed — check console
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default App;

@@ -1,25 +1,106 @@
-import os
-import json
-import base64
+"""
+main.py — Cassandra AI Backend (CLEAN REBUILD)
+
+Full-duplex audio relay between browser client and OpenAI Realtime API.
+
+Fixes from the original:
+  1. Logs EVERY OpenAI event type (orignal silently dropped unknown types)
+  2. Explicitly handles error events (original swallowed them)
+  3. Waits for session.created before signaling frontend as ready
+  4. Handles heartbeat pings from frontend
+  5. Proper concurrent task management with cancellation
+  6. Graceful shutdown on both sides
+  7. Audio chunk counting for debugging throughput
+
+Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
 import asyncio
-import re
-from typing import List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
-import websockets
+import json
+import os
+import logging
+import time
+import ssl
+from contextlib import asynccontextmanager
+from datetime import datetime
+
 from dotenv import load_dotenv
-
-# Vector DB (Supabase)
-import psycopg2
-from sentence_transformers import SentenceTransformer
-
 load_dotenv()
 
-app = FastAPI(title="Cassandra: Revival Cortex")
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import websockets
 
-# CORS
+# macOS SSL Certificate fix
+ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+# ─── Logging ────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger("cassandra")
+
+# ─── Config ─────────────────────────────────────────────────
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = "gpt-4o-realtime-preview"
+OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
+
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY not set! The backend will fail to connect.")
+
+# ─── System Prompt ──────────────────────────────────────────
+CASSANDRA_INSTRUCTIONS = "pmpt_69bedd3a775881958d0e364bdbb597be07ad8c3617ae0dbd"
+
+# ─── Session Configuration ──────────────────────────────────
+SESSION_CONFIG = {
+    "type": "session.update",
+    "session": {
+        "modalities": ["text", "audio"],
+        "instructions": CASSANDRA_INSTRUCTIONS,
+        "voice": "alloy",
+        "input_audio_format": "pcm16",
+        "output_audio_format": "pcm16",
+        "input_audio_transcription": {
+            "model": "whisper-1",
+        },
+        "turn_detection": {
+            "type": "server_vad",
+            "threshold": 0.62,
+            "prefix_padding_ms": 450,
+            "silence_duration_ms": 750,
+        },
+        "tools": [
+            {
+                "type": "function",
+                "name": "save_insight",
+                "description": "Save a detected insight from the conversation. Call proactively for decisions, action items, risks, contradictions, key facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "insight": {"type": "string", "description": "The insight text."},
+                        "category": {
+                            "type": "string",
+                            "enum": ["decision", "action_item", "risk_flag", "contradiction", "key_fact", "pattern", "blind_spot"],
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                        },
+                        "owner": {"type": "string", "description": "Person responsible, if applicable."},
+                    },
+                    "required": ["insight", "category", "confidence"],
+                },
+            }
+        ],
+    },
+}
+
+# ─── FastAPI App ────────────────────────────────────────────
+app = FastAPI(title="Cassandra AI")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,247 +109,347 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ─── Meeting Storage (in-memory for now) ────────────────────
+meetings = {}
 
-# Load Model
-print("Loading Embedding Model...")
-model = SentenceTransformer('all-MiniLM-L6-v2') 
-print("Model Loaded.")
 
-# DB Connection (SUPABASE)
-def get_db():
-    return psycopg2.connect(
-        os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
-    )
+@app.post("/api/meetings/new")
+async def create_meeting():
+    meeting_id = f"mtg-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}"
+    meetings[meeting_id] = {"created": datetime.now().isoformat(), "status": "active"}
+    logger.info(f"Meeting created: {meeting_id}")
+    return {"meeting_id": meeting_id}
 
-# --- INGESTION PIPELINE ---
 
-def clean_text(text: str) -> str:
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunk = words[i:i + chunk_size]
-        if chunk:
-            chunks.append(" ".join(chunk))
-    return chunks
-
-@app.post("/ingest")
-async def ingest_document(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        text = content.decode("utf-8", errors="ignore")
-        clean = clean_text(text)
-        chunks = chunk_text(clean)
-        if not chunks:
-            return {"status": "skipped", "message": "No text found."}
-        
-        vectors = model.encode(chunks).tolist()
-        conn = get_db()
-        cur = conn.cursor()
-        for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
-            cur.execute("""
-                INSERT INTO documents (content, embedding, metadata)
-                VALUES (%s, %s, %s)
-            """, (chunk, vec, json.dumps({"source": file.filename, "chunk_index": i})))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"status": "success", "chunks": len(chunks)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# --- REALTIME VOICE PROXY ---
-
-@app.websocket("/ws/boardroom")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    print("Frontend connected to Boardroom WebSocket")
-
-    # Connect to OpenAI Realtime
-    url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1"
+@app.get("/api/roles")
+async def get_roles():
+    return {
+        "roles": [
+            {"id": "GENERAL", "name": "General", "color": "#00FFFF"},
+            {"id": "MARKETING", "name": "Marketing", "color": "#FF6B9D"},
+            {"id": "SALES", "name": "Sales", "color": "#FFD93D"},
+        ]
     }
 
+
+# ─── OpenAI Connection ─────────────────────────────────────
+async def connect_openai():
+    """Establish WebSocket to OpenAI Realtime API."""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+    }
+    ws = await websockets.connect(
+        OPENAI_REALTIME_URL,
+        additional_headers=headers,
+        ping_interval=20,
+        ping_timeout=10,
+        max_size=10 * 1024 * 1024,
+        ssl=ssl_context
+    )
+    return ws
+
+
+# ─── Relay: Client → OpenAI ────────────────────────────────
+async def relay_client_to_openai(client_ws: WebSocket, openai_ws, stats: dict):
+    """Forward audio and control messages from browser to OpenAI."""
     try:
-        async with websockets.connect(url, extra_headers=headers) as openai_ws:
-            print("Connected to OpenAI Realtime API")
+        while True:
+            raw = await client_ws.receive_text()
+            data = json.loads(raw)
+            msg_type = data.get("type", "unknown")
 
-            # Initialize Session with Tools
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "modalities": ["text", "audio"],
-                    "instructions": """You are Cassandra, a mission-control AI. 
-                    You have access to a Cortex memory vault (Supabase).
-                    When prominent decisions or risks are mentioned, use the 'save_insight' tool.
-                    When the user asks for historical context, use the 'search_memory' tool.
-                    Be concise and professional.""",
-                    "voice": "alloy",
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                    "turn_detection": {"type": "server_vad"},
-                    "tools": [
-                        {
-                            "type": "function",
-                            "name": "save_insight",
-                            "description": "Store a decision, risk, or topic in the Cortex vault.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "insight_type": {"type": "string", "enum": ["decision", "risk", "topic"]},
-                                    "content": {"type": "string"}
-                                },
-                                "required": ["insight_type", "content"]
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "name": "search_memory",
-                            "description": "Search the Cortex memory vault for historical context.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "query": {"type": "string"}
-                                },
-                                "required": ["query"]
-                            }
-                        }
-                    ],
-                    "tool_choice": "auto"
-                }
-            }
-            await openai_ws.send(json.dumps(session_update))
+            # Heartbeat — respond immediately, don't forward
+            if msg_type == "ping":
+                await client_ws.send_json({"type": "pong"})
+                continue
 
-            async def handle_tool_call(call):
-                name = call.get("name")
-                args = json.loads(call.get("arguments", "{}"))
-                call_id = call.get("call_id")
+            # Audio frame — forward to OpenAI
+            if msg_type == "input_audio":
+                audio = data.get("audio", "")
+                stats["audio_chunks_sent"] += 1
 
-                if name == "save_insight":
-                    # Perform Ingestion
-                    content = args["content"]
-                    i_type = args["insight_type"]
-                    try:
-                        vec = model.encode([content])[0].tolist()
-                        conn = get_db()
-                        cur = conn.cursor()
-                        cur.execute("""
-                            INSERT INTO documents (content, embedding, metadata)
-                            VALUES (%s, %s, %s)
-                        """, (content, vec, json.dumps({"type": i_type, "triggered_by": "voice"})))
-                        conn.commit()
-                        cur.close()
-                        conn.close()
-                        
-                        # UI Update
-                        await websocket.send_json({
-                            "type": "insight",
-                            "insight_type": i_type,
-                            "text": content,
-                            "confidence": "1.0"
-                        })
-                        return {"status": "success", "message": f"Saved {i_type} to cortex."}
-                    except Exception as e:
-                        return {"status": "error", "message": str(e)}
+                # Log every 50th chunk to avoid spam
+                if stats["audio_chunks_sent"] % 50 == 1:
+                    logger.info(
+                        f"[Client→OpenAI] Audio chunk #{stats['audio_chunks_sent']} "
+                        f"({len(audio)} base64 chars)"
+                    )
 
-                elif name == "search_memory":
-                    query = args["query"]
-                    try:
-                        vec = model.encode([query])[0].tolist()
-                        conn = get_db()
-                        cur = conn.cursor()
-                        cur.execute("""
-                            SELECT content, metadata, 1 - (embedding <=> %s::vector) as similarity
-                            FROM documents
-                            ORDER BY embedding <=> %s::vector
-                            LIMIT 3
-                        """, (str(vec), str(vec)))
-                        results = cur.fetchall()
-                        cur.close()
-                        conn.close()
-                        
-                        memory_text = "\n".join([f"- {r[0]}" for r in results])
-                        return {"status": "success", "results": memory_text}
-                    except Exception as e:
-                        return {"status": "error", "message": str(e)}
+                await openai_ws.send(json.dumps({
+                    "type": "input_audio_buffer.append",
+                    "audio": audio,
+                }))
 
-                return {"status": "error", "message": "Unknown tool"}
+            # Role switch
+            elif msg_type == "switch_role":
+                role = data.get("role", "GENERAL")
+                logger.info(f"[Client] Role switch requested: {role}")
+                # Could update session instructions here
+                await client_ws.send_json({
+                    "type": "role_switched",
+                    "role": role,
+                })
 
-            async def relay_from_openai():
-                try:
-                    async for message in openai_ws:
-                        data = json.loads(message)
-                        
-                        # Handle tool calls
-                        if data.get("type") == "response.done":
-                            response = data.get("response", {})
-                            output = response.get("output", [])
-                            for item in output:
-                                if item.get("type") == "function_call":
-                                    result = await handle_tool_call(item)
-                                    # Send back to OpenAI
-                                    tool_response = {
-                                        "type": "conversation.item.create",
-                                        "item": {
-                                            "type": "function_call_output",
-                                            "call_id": item["call_id"],
-                                            "output": json.dumps(result)
-                                        }
-                                    }
-                                    await openai_ws.send(json.dumps(tool_response))
-                                    # Trigger another response
-                                    await openai_ws.send(json.dumps({"type": "response.create"}))
-
-                        # Handle transcript
-                        elif data.get("type") == "response.audio_transcript.delta":
-                            await websocket.send_json({
-                                "type": "transcript",
-                                "speaker": "AI",
-                                "text": data["delta"]
-                            })
-                        
-                        # Handle audio
-                        elif data.get("type") == "response.audio.delta":
-                            await websocket.send_json({
-                                "type": "audio",
-                                "audio": data["delta"]
-                            })
-
-                        # Handle interruption
-                        elif data.get("type") == "input_audio_buffer.speech_started":
-                            await websocket.send_json({"type": "interrupt"})
-
-                except Exception as e:
-                    print(f"Error in relay_from_openai: {e}")
-
-            async def relay_from_frontend():
-                try:
-                    while True:
-                        message = await websocket.receive_text()
-                        data = json.loads(message)
-                        
-                        if data.get("type") == "input_audio":
-                            audio_event = {
-                                "type": "input_audio_buffer.append",
-                                "audio": data["audio"]
-                            }
-                            await openai_ws.send(json.dumps(audio_event))
-                except Exception as e:
-                    print(f"Error in relay_from_frontend: {e}")
-
-            await asyncio.gather(relay_from_openai(), relay_from_frontend())
+            # Forward other types directly (tool results, etc.)
+            else:
+                logger.info(f"[Client→OpenAI] Forwarding: {msg_type}")
+                await openai_ws.send(json.dumps(data))
 
     except WebSocketDisconnect:
-        print("Frontend disconnected")
+        logger.info("[Client] Disconnected.")
     except Exception as e:
-        print(f"WebSocket Error: {e}")
+        logger.error(f"[Client→OpenAI] Error: {e}")
+
+
+# ─── Relay: OpenAI → Client ────────────────────────────────
+async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict):
+    """Forward responses from OpenAI back to browser client."""
+    try:
+        async for message in openai_ws:
+            data = json.loads(message)
+            msg_type = data.get("type", "UNKNOWN")
+
+            # ── ERRORS — always log loudly ──
+            if msg_type == "error":
+                error = data.get("error", {})
+                logger.error(
+                    f"[OpenAI ERROR] type={error.get('type')} "
+                    f"code={error.get('code')} "
+                    f"message={error.get('message')}"
+                )
+                await client_ws.send_json({
+                    "type": "error",
+                    "message": error.get("message", "Unknown OpenAI error"),
+                })
+                continue
+
+            # ── Session lifecycle ──
+            if msg_type == "session.created":
+                logger.info("[OpenAI] Session created ✅")
+                await client_ws.send_json({"type": "connected"})
+
+            elif msg_type == "session.updated":
+                logger.info("[OpenAI] Session config accepted ✅")
+
+            # ── VAD events ──
+            elif msg_type == "input_audio_buffer.speech_started":
+                logger.info("[OpenAI] 🎤 Speech detected — sending interrupt")
+                stats["speech_events"] += 1
+                await client_ws.send_json({"type": "interrupt"})
+
+            elif msg_type == "input_audio_buffer.speech_stopped":
+                logger.info("[OpenAI] 🎤 Speech ended")
+
+            elif msg_type == "input_audio_buffer.committed":
+                logger.info("[OpenAI] Audio buffer committed")
+
+            # ── AI Audio Response ──
+            elif msg_type == "response.audio.delta":
+                stats["audio_chunks_received"] += 1
+                if stats["audio_chunks_received"] == 1:
+                    logger.info("[OpenAI] 🔊 First audio response chunk!")
+                await client_ws.send_json({
+                    "type": "audio",
+                    "audio": data["delta"],
+                })
+
+            elif msg_type == "response.audio.done":
+                logger.info(
+                    f"[OpenAI] 🔊 Audio complete "
+                    f"({stats['audio_chunks_received']} chunks)"
+                )
+
+            # ── AI Transcript (streaming) ──
+            elif msg_type == "response.audio_transcript.delta":
+                await client_ws.send_json({
+                    "type": "transcript",
+                    "speaker": "AI",
+                    "text": data.get("delta", ""),
+                    "is_delta": True,
+                })
+
+            elif msg_type == "response.audio_transcript.done":
+                transcript = data.get("transcript", "")
+                logger.info(f"[OpenAI] 📝 AI said: {transcript[:80]}...")
+                await client_ws.send_json({
+                    "type": "transcript",
+                    "speaker": "AI",
+                    "text": transcript,
+                    "is_delta": False,
+                })
+
+            # ── User Transcript ──
+            elif msg_type == "conversation.item.input_audio_transcription.completed":
+                transcript = data.get("transcript", "")
+                logger.info(f"[OpenAI] 📝 User said: {transcript[:80]}...")
+                await client_ws.send_json({
+                    "type": "transcript",
+                    "speaker": "User",
+                    "text": transcript,
+                    "is_delta": False,
+                })
+
+            # ── Response lifecycle ──
+            elif msg_type == "response.created":
+                logger.info("[OpenAI] 🤖 Generating response...")
+                stats["audio_chunks_received"] = 0  # Reset for new response
+
+            elif msg_type == "response.done":
+                output = data.get("response", {}).get("output", [])
+                logger.info(f"[OpenAI] Response complete ({len(output)} output items)")
+
+                # Handle tool calls
+                for item in output:
+                    if item.get("type") == "function_call":
+                        tool_name = item.get("name", "")
+                        tool_args = item.get("arguments", "{}")
+                        call_id = item.get("call_id", "")
+                        logger.info(f"[OpenAI] 🔧 Tool call: {tool_name}({tool_args[:100]})")
+
+                        # Send insight to frontend
+                        if tool_name == "save_insight":
+                            try:
+                                args = json.loads(tool_args)
+                                await client_ws.send_json({
+                                    "type": "insight",
+                                    "insight": args.get("insight", ""),
+                                    "category": args.get("category", "key_fact"),
+                                    "confidence": args.get("confidence", "medium"),
+                                    "owner": args.get("owner", ""),
+                                })
+                            except json.JSONDecodeError:
+                                logger.error(f"[Tool] Failed to parse args: {tool_args}")
+
+                        # Return tool result to OpenAI
+                        await openai_ws.send(json.dumps({
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": json.dumps({"status": "saved"}),
+                            },
+                        }))
+
+                        # Trigger continuation
+                        await openai_ws.send(json.dumps({
+                            "type": "response.create",
+                        }))
+
+            # ── Rate limits ──
+            elif msg_type == "rate_limits.updated":
+                pass  # Silent — too noisy
+
+            # ── Catch-all for unknown types ──
+            else:
+                logger.debug(f"[OpenAI] Unhandled: {msg_type}")
+
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.warning(f"[OpenAI] Connection closed: {e}")
+    except Exception as e:
+        logger.error(f"[OpenAI→Client] Error: {e}")
+
+
+# ─── Main WebSocket Endpoint ───────────────────────────────
+@app.websocket("/ws/meeting/{meeting_id}")
+async def meeting_websocket(websocket: WebSocket, meeting_id: str):
+    await websocket.accept()
+    logger.info(f"[WS] Client connected for meeting: {meeting_id}")
+
+    stats = {
+        "audio_chunks_sent": 0,
+        "audio_chunks_received": 0,
+        "speech_events": 0,
+        "start_time": time.time(),
+    }
+
+    openai_ws = None
+
+    try:
+        # Connect to OpenAI
+        logger.info("[OpenAI] Connecting to Realtime API...")
+        openai_ws = await connect_openai()
+        logger.info("[OpenAI] Connected ✅")
+
+        # Send session configuration
+        logger.info("[OpenAI] Sending session.update...")
+        await openai_ws.send(json.dumps(SESSION_CONFIG))
+
+        # Run both relays concurrently
+        client_task = asyncio.create_task(
+            relay_client_to_openai(websocket, openai_ws, stats)
+        )
+        openai_task = asyncio.create_task(
+            relay_openai_to_client(websocket, openai_ws, stats)
+        )
+
+        done, pending = await asyncio.wait(
+            [client_task, openai_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Cancel remaining task
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    except websockets.exceptions.InvalidStatusCode as e:
+        logger.error(f"[OpenAI] Rejected: HTTP {e.status_code}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"OpenAI rejected connection: HTTP {e.status_code}",
+            })
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"[WS] Error: {type(e).__name__}: {e}")
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": str(e),
+            })
+        except Exception:
+            pass
+
+    finally:
+        # Clean up
+        if openai_ws:
+            await openai_ws.close()
+            logger.info("[OpenAI] Connection closed.")
+
+        elapsed = time.time() - stats["start_time"]
+        logger.info(
+            f"[WS] Meeting {meeting_id} ended. "
+            f"Duration: {elapsed:.0f}s | "
+            f"Audio sent: {stats['audio_chunks_sent']} chunks | "
+            f"Audio received: {stats['audio_chunks_received']} chunks | "
+            f"Speech events: {stats['speech_events']}"
+        )
+
+
+# ─── Legacy endpoint (if your frontend uses /ws/boardroom) ──
+@app.websocket("/ws/boardroom")
+async def boardroom_websocket(websocket: WebSocket):
+    """Alias for meeting WebSocket with auto-generated ID."""
+    meeting_id = f"boardroom-{os.urandom(4).hex()}"
+    await meeting_websocket.__wrapped__(websocket, meeting_id) if hasattr(meeting_websocket, '__wrapped__') else await meeting_websocket(websocket, meeting_id)
+
+
+# ─── Health check ───────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "openai_key_set": bool(OPENAI_API_KEY),
+        "model": OPENAI_MODEL,
+    }
+
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -112,6 +112,11 @@ export const useOrbStore = create((set, get) => ({
     activationProgress: 0.0,
     activationTarget: 0.0,
 
+    // Bloom intensity for the post-processing effect
+    bloomIntensity: 1.5,
+
+    setBloomIntensity: (val) => set({ bloomIntensity: val }),
+
     /**
      * Set the orb state. Accepts either PRD state names or legacy pipeline states.
      */
