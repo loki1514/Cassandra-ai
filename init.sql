@@ -35,6 +35,7 @@ create index if not exists artifacts_embedding_idx on public.artifacts using hns
 create index if not exists transcripts_embedding_idx on public.transcripts using hnsw (embedding vector_cosine_ops);
 
 -- RPC: semantic search over artifacts
+drop function if exists public.match_artifacts(vector, float, int);
 create or replace function match_artifacts (
   query_embedding vector(1536),
   match_threshold float,
@@ -64,6 +65,7 @@ as $func$
 $func$;
 
 -- RPC: semantic search over transcript chunks (PageIndex)
+drop function if exists public.match_transcripts(vector, float, int);
 create or replace function match_transcripts (
   query_embedding vector(1536),
   match_threshold float,

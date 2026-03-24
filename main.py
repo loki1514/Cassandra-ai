@@ -29,6 +29,7 @@ load_dotenv()
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import websockets
+from supabase import create_client, Client
 
 # macOS SSL Certificate fix
 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -50,6 +51,15 @@ OPENAI_REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={OPENAI_MODEL}"
 
 if not OPENAI_API_KEY:
     logger.error("OPENAI_API_KEY not set! The backend will fail to connect.")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logger.error("Supabase credentials not set!")
+    supabase: Client = None
+else:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ─── System Prompt ──────────────────────────────────────────
 CASSANDRA_INSTRUCTIONS = "pmpt_69bedd3a775881958d0e364bdbb597be07ad8c3617ae0dbd"
@@ -116,8 +126,20 @@ meetings = {}
 @app.post("/api/meetings/new")
 async def create_meeting():
     meeting_id = f"mtg-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}"
+    
+    if supabase:
+        try:
+            # We use the generated string as a 'title' or just track it. 
+            # The database schema has a UUID primary key, so we'll store our meeting_id as title.
+            data, count = supabase.table("meetings").insert({"title": meeting_id}).execute()
+            db_id = data[1][0]["id"]
+            logger.info(f"Meeting created in DB: {meeting_id} (UUID: {db_id})")
+            return {"meeting_id": db_id} # Return the actual DB UUID
+        except Exception as e:
+            logger.error(f"Failed to create meeting in Supabase: {e}")
+    
     meetings[meeting_id] = {"created": datetime.now().isoformat(), "status": "active"}
-    logger.info(f"Meeting created: {meeting_id}")
+    logger.info(f"Meeting created (fallback): {meeting_id}")
     return {"meeting_id": meeting_id}
 
 
@@ -203,7 +225,7 @@ async def relay_client_to_openai(client_ws: WebSocket, openai_ws, stats: dict):
 
 
 # ─── Relay: OpenAI → Client ────────────────────────────────
-async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict):
+async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict, meeting_id: str):
     """Forward responses from OpenAI back to browser client."""
     try:
         async for message in openai_ws:
@@ -272,6 +294,17 @@ async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict):
             elif msg_type == "response.audio_transcript.done":
                 transcript = data.get("transcript", "")
                 logger.info(f"[OpenAI] 📝 AI said: {transcript[:80]}...")
+                
+                if supabase and meeting_id:
+                    try:
+                        supabase.table("transcripts").insert({
+                            "meeting_id": meeting_id,
+                            "speaker_role": "ai",
+                            "content": transcript
+                        }).execute()
+                    except Exception as e:
+                        logger.error(f"Failed to save AI transcript: {e}")
+
                 await client_ws.send_json({
                     "type": "transcript",
                     "speaker": "AI",
@@ -283,6 +316,17 @@ async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict):
             elif msg_type == "conversation.item.input_audio_transcription.completed":
                 transcript = data.get("transcript", "")
                 logger.info(f"[OpenAI] 📝 User said: {transcript[:80]}...")
+
+                if supabase and meeting_id:
+                    try:
+                        supabase.table("transcripts").insert({
+                            "meeting_id": meeting_id,
+                            "speaker_role": "user",
+                            "content": transcript
+                        }).execute()
+                    except Exception as e:
+                        logger.error(f"Failed to save User transcript: {e}")
+
                 await client_ws.send_json({
                     "type": "transcript",
                     "speaker": "User",
@@ -311,6 +355,32 @@ async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict):
                         if tool_name == "save_insight":
                             try:
                                 args = json.loads(tool_args)
+                                
+                                if supabase and meeting_id:
+                                    try:
+                                        # Map category to allowed enum in DB: ('decision', 'risk', 'topic', 'summary')
+                                        # or adjust if you have a different enum.
+                                        # PRD says: ("decision", "action_item", "risk_flag", "contradiction", "key_fact", "pattern", "blind_spot")
+                                        # Actual init.sql check: artifact_type in ('decision', 'risk', 'topic', 'summary')
+                                        # I'll use a mapping or set a default.
+                                        
+                                        type_map = {
+                                            "decision": "decision",
+                                            "risk_flag": "risk",
+                                            "key_fact": "topic",
+                                            "action_item": "topic"
+                                        }
+                                        a_type = type_map.get(args.get("category"), "topic")
+                                        
+                                        supabase.table("artifacts").insert({
+                                            "meeting_id": meeting_id,
+                                            "artifact_type": a_type,
+                                            "content": args.get("insight", ""),
+                                            "confidence": 0.9 # Default float
+                                        }).execute()
+                                    except Exception as e:
+                                        logger.error(f"Failed to save insight to DB: {e}")
+
                                 await client_ws.send_json({
                                     "type": "insight",
                                     "insight": args.get("insight", ""),
@@ -380,7 +450,7 @@ async def meeting_websocket(websocket: WebSocket, meeting_id: str):
             relay_client_to_openai(websocket, openai_ws, stats)
         )
         openai_task = asyncio.create_task(
-            relay_openai_to_client(websocket, openai_ws, stats)
+            relay_openai_to_client(websocket, openai_ws, stats, meeting_id)
         )
 
         done, pending = await asyncio.wait(
