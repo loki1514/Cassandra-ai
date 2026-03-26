@@ -1,10 +1,11 @@
 let orbState = 'DORMANT';
-let numPoints = 800;
+window.orbState = orbState; // expose for pipeline.js reads
 
-let baseSpeed = 0.018;
-let bassSensitivity = 2.0;
-let rotSensitivity = 0.02;
-let rotDirection = 1;
+let numPoints = 800;
+let baseSpeed        = 0.018;
+let bassSensitivity  = 2.0;
+let rotSensitivity   = 0.02;
+let rotDirection     = 1;
 
 // Mode Colors
 const modeColors = {
@@ -49,18 +50,11 @@ function setup() {
     createCanvas(windowWidth, windowHeight, WEBGL);
     sphereRadius = windowHeight * 0.13;
     noStroke();
-
-    mic = new p5.AudioIn();
-    fft = new p5.FFT(0.8);
-    fft.setInput(mic);
+    // p5.sound removed — audio handled by AudioWorklet in pipeline.js
 }
 
 function draw() {
-    clear(); // transparent so CSS background shows
-
-    if (!isAudioStarted) {
-        return;
-    }
+    clear();
 
     if (orbState === 'DORMANT') {
         targetColor1 = colorDormant1;
@@ -79,22 +73,18 @@ function draw() {
         targetColor2 = colorMemory2;
     }
 
-    // Lerp colors for smooth transitions
     for (let i = 0; i < 3; i++) {
         angleColor1[i] = lerp(angleColor1[i], targetColor1[i], 0.05);
         angleColor2[i] = lerp(angleColor2[i], targetColor2[i], 0.05);
     }
 
-    fft.analyze();
-    let bassEnergy = fft.getEnergy("bass");
-    let trebleEnergy = fft.getEnergy("treble");
-    let highMidEnergy = fft.getEnergy("highMid");
-
-    if ((orbState === 'SPEAKING' || orbState === 'MEMORY_RECALL') && window.getAudioEnergy) {
-        let energy = window.getAudioEnergy();
-        bassEnergy = max(bassEnergy, energy.bass || 0);
-        highMidEnergy = max(highMidEnergy, energy.mid || 0);
-        trebleEnergy = max(trebleEnergy, energy.treble || 0);
+    // Read energy from PlaybackSystem (or zero when not speaking)
+    let bassEnergy = 0, trebleEnergy = 0, highMidEnergy = 0;
+    if (window.getAudioEnergy) {
+        const e = window.getAudioEnergy();
+        bassEnergy    = e.bass    || 0;
+        highMidEnergy = e.mid     || 0;
+        trebleEnergy  = e.treble  || 0;
     }
 
     let melodyMap = map(trebleEnergy + highMidEnergy, 200, 512, 0, rotSensitivity);
@@ -160,31 +150,27 @@ function windowResized() {
 
 window.setOrbState = function (state) {
     orbState = state;
-    document.getElementById('status-text').innerText = `SYSTEM ${state}`;
+    window.orbState = state; // keep window ref in sync
+    const el = document.getElementById('status-text');
+    if (el) el.innerText = `SYSTEM ${state}`;
 };
 
 window.setAgentMode = function (mode) {
     currentMode = mode;
-    colorDormant1 = [...modeColors[mode].c1];
-    colorDormant2 = [...modeColors[mode].c2];
-    document.getElementById('sub-status').innerText = `Initializing ${mode} Protocol...`;
+    colorDormant1 = [...modeColors[mode]?.c1 ?? modeColors['GENERAL'].c1];
+    colorDormant2 = [...modeColors[mode]?.c2 ?? modeColors['GENERAL'].c2];
+    document.getElementById('sub-status').innerText = `Initializing ${mode} Protocol…`;
     setTimeout(() => {
         document.getElementById('sub-status').innerText = `${mode} PROTOCOL ACTIVE`;
     }, 1500);
 };
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener('DOMContentLoaded', () => {
     const clickTarget = document.getElementById('orb-click-target');
     if (clickTarget) {
         clickTarget.addEventListener('click', () => {
-            if (!isAudioStarted) {
-                userStartAudio();
-                mic.start();
-                isAudioStarted = true;
-
-                if (window.initBackendPipeline) {
-                    window.initBackendPipeline();
-                }
+            if (window.initBackendPipeline) {
+                window.initBackendPipeline();
             }
         });
     }
