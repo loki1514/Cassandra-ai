@@ -18,7 +18,7 @@ def generate_embedding(text: str) -> list[float]:
 def store_meeting_insight(meeting_id: str, artifact_type: ArtifactType, content: str, confidence: float):
     """Generates embeddings and stores the artifact to Supabase."""
     embedding = generate_embedding(content)
-    
+
     data = {
         "meeting_id": meeting_id,
         "artifact_type": artifact_type.value,
@@ -26,7 +26,26 @@ def store_meeting_insight(meeting_id: str, artifact_type: ArtifactType, content:
         "confidence": confidence,
         "embedding": embedding
     }
-    
+
+    response = supabase.table("artifacts").insert(data).execute()
+    return response.data
+
+def save_artifact_with_embedding(meeting_id: str, artifact_type_str: str, content: str, confidence: float = 0.9):
+    """
+    Plain-string variant used by main.py event handlers.
+    artifact_type_str must be one of: 'decision', 'risk', 'topic', 'summary'
+    (matches the DB check constraint).
+    """
+    embedding = generate_embedding(content)
+
+    data = {
+        "meeting_id": meeting_id,
+        "artifact_type": artifact_type_str,
+        "content": content,
+        "confidence": confidence,
+        "embedding": embedding
+    }
+
     response = supabase.table("artifacts").insert(data).execute()
     return response.data
 

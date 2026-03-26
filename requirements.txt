@@ -6,4 +6,5 @@ openai
 supabase
 pydantic
 pydantic-settings
+python-docx
 

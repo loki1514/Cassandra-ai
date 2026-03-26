@@ -26,10 +26,18 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 import websockets
 from supabase import create_client, Client
+from pydantic import BaseModel
+
+# ─── Services layer ─────────────────────────────────────────
+from services.pageindex import index_transcript_chunk
+from services.memory import save_artifact_with_embedding
+from services.retrieval import search_all_context
+from services.exporter import generate_meeting_docx
 
 # macOS SSL Certificate fix
 ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -294,16 +302,18 @@ async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict, m
             elif msg_type == "response.audio_transcript.done":
                 transcript = data.get("transcript", "")
                 logger.info(f"[OpenAI] 📝 AI said: {transcript[:80]}...")
-                
-                if supabase and meeting_id:
+
+                if supabase and meeting_id and transcript:
                     try:
-                        supabase.table("transcripts").insert({
-                            "meeting_id": meeting_id,
-                            "speaker_role": "ai",
-                            "content": transcript
-                        }).execute()
+                        stats["chunk_counter"] += 1
+                        chunk_idx = stats["chunk_counter"]
+                        await asyncio.to_thread(
+                            index_transcript_chunk,
+                            meeting_id, "ai", transcript, chunk_idx
+                        )
+                        logger.info(f"[Embed] AI transcript chunk #{chunk_idx} embedded ✅")
                     except Exception as e:
-                        logger.error(f"Failed to save AI transcript: {e}")
+                        logger.error(f"Failed to embed AI transcript: {e}")
 
                 await client_ws.send_json({
                     "type": "transcript",
@@ -317,15 +327,17 @@ async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict, m
                 transcript = data.get("transcript", "")
                 logger.info(f"[OpenAI] 📝 User said: {transcript[:80]}...")
 
-                if supabase and meeting_id:
+                if supabase and meeting_id and transcript:
                     try:
-                        supabase.table("transcripts").insert({
-                            "meeting_id": meeting_id,
-                            "speaker_role": "user",
-                            "content": transcript
-                        }).execute()
+                        stats["chunk_counter"] += 1
+                        chunk_idx = stats["chunk_counter"]
+                        await asyncio.to_thread(
+                            index_transcript_chunk,
+                            meeting_id, "user", transcript, chunk_idx
+                        )
+                        logger.info(f"[Embed] User transcript chunk #{chunk_idx} embedded ✅")
                     except Exception as e:
-                        logger.error(f"Failed to save User transcript: {e}")
+                        logger.error(f"Failed to embed User transcript: {e}")
 
                 await client_ws.send_json({
                     "type": "transcript",
@@ -355,35 +367,32 @@ async def relay_openai_to_client(client_ws: WebSocket, openai_ws, stats: dict, m
                         if tool_name == "save_insight":
                             try:
                                 args = json.loads(tool_args)
-                                
-                                if supabase and meeting_id:
+
+                                type_map = {
+                                    "decision": "decision",
+                                    "risk_flag": "risk",
+                                    "key_fact": "topic",
+                                    "action_item": "topic",
+                                    "contradiction": "topic",
+                                    "pattern": "topic",
+                                    "blind_spot": "risk",
+                                }
+                                a_type = type_map.get(args.get("category"), "topic")
+                                insight_text = args.get("insight", "")
+
+                                if meeting_id and insight_text:
                                     try:
-                                        # Map category to allowed enum in DB: ('decision', 'risk', 'topic', 'summary')
-                                        # or adjust if you have a different enum.
-                                        # PRD says: ("decision", "action_item", "risk_flag", "contradiction", "key_fact", "pattern", "blind_spot")
-                                        # Actual init.sql check: artifact_type in ('decision', 'risk', 'topic', 'summary')
-                                        # I'll use a mapping or set a default.
-                                        
-                                        type_map = {
-                                            "decision": "decision",
-                                            "risk_flag": "risk",
-                                            "key_fact": "topic",
-                                            "action_item": "topic"
-                                        }
-                                        a_type = type_map.get(args.get("category"), "topic")
-                                        
-                                        supabase.table("artifacts").insert({
-                                            "meeting_id": meeting_id,
-                                            "artifact_type": a_type,
-                                            "content": args.get("insight", ""),
-                                            "confidence": 0.9 # Default float
-                                        }).execute()
+                                        await asyncio.to_thread(
+                                            save_artifact_with_embedding,
+                                            meeting_id, a_type, insight_text, 0.9
+                                        )
+                                        logger.info(f"[Embed] Artifact '{a_type}' embedded ✅")
                                     except Exception as e:
-                                        logger.error(f"Failed to save insight to DB: {e}")
+                                        logger.error(f"Failed to embed artifact: {e}")
 
                                 await client_ws.send_json({
                                     "type": "insight",
-                                    "insight": args.get("insight", ""),
+                                    "insight": insight_text,
                                     "category": args.get("category", "key_fact"),
                                     "confidence": args.get("confidence", "medium"),
                                     "owner": args.get("owner", ""),
@@ -431,6 +440,7 @@ async def meeting_websocket(websocket: WebSocket, meeting_id: str):
         "audio_chunks_received": 0,
         "speech_events": 0,
         "start_time": time.time(),
+        "chunk_counter": 0,  # Monotonic counter for transcript chunk_index
     }
 
     openai_ws = None
@@ -518,6 +528,46 @@ async def health():
         "openai_key_set": bool(OPENAI_API_KEY),
         "model": OPENAI_MODEL,
     }
+
+
+# ─── Context Search Endpoint ────────────────────────────────
+class ContextRequest(BaseModel):
+    query: str
+    meeting_id: str = ""
+
+
+@app.post("/api/context")
+async def get_context(request: ContextRequest):
+    """
+    Semantic search over transcripts and artifacts.
+    Returns the most relevant context chunks for a given query.
+    """
+    try:
+        context = await asyncio.to_thread(search_all_context, request.query)
+        return {"query": request.query, "context": context}
+    except Exception as e:
+        logger.error(f"[Context] Search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── DOCX Export Endpoint ────────────────────────────────────
+@app.get("/api/meetings/{meeting_id}/export/docx")
+async def export_meeting_docx(meeting_id: str):
+    """
+    Generates and downloads a .docx file for the given meeting,
+    containing the full transcript, decisions, risks, and action items.
+    """
+    try:
+        docx_bytes = await asyncio.to_thread(generate_meeting_docx, meeting_id)
+        filename = f"meeting_{meeting_id[:8]}_{datetime.now().strftime('%Y%m%d')}.docx"
+        return Response(
+            content=docx_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        logger.error(f"[Export] DOCX generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
