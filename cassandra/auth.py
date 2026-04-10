@@ -455,9 +455,45 @@ def require_org_access(org_id_param: str = "org_id"):
     async def _check_org_access(
         user: UserContext = Depends(get_current_user)
     ) -> UserContext:
-        # In real implementation, check if user has access to org
-        # For now, trust the org_id in the token
-        return user
+        # SECURITY: Verify user has access to the requested org
+        # Query database to confirm user's org membership
+        from cassandra.config import settings
+        from supabase import create_client
+        
+        try:
+            supabase = create_client(
+                settings.SUPABASE_URL,
+                settings.SUPABASE_SERVICE_ROLE_KEY
+            )
+            
+            # Check if user belongs to the org in their token
+            result = supabase.table("users")\
+                .select("id")\
+                .eq("id", user.user_id)\
+                .eq("org_id", user.org_id)\
+                .execute()
+            
+            if not result.data:
+                logger.warning(
+                    "org_access_denied",
+                    user_id=user.user_id,
+                    requested_org=user.org_id
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="User does not have access to this organization"
+                )
+            
+            return user
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("org_access_check_failed", error=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to verify organization access"
+            ) from e
     
     return _check_org_access
 
