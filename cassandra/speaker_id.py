@@ -289,12 +289,72 @@ def extract_embedding_sync(audio_segment: bytes) -> np.ndarray:
 # Speaker Matching
 # =============================================================================
 
-# In-memory speaker database (replace with vector DB in production)
-# Structure: {org_id: {speaker_id: embedding}}
-_speaker_db: Dict[str, Dict[str, np.ndarray]] = {}
-
 # Default similarity threshold
 SIMILARITY_THRESHOLD = 0.85
+
+# Database-backed speaker storage
+# Uses Supabase for persistence across restarts and horizontal scaling
+from cassera.config import settings
+
+
+class SpeakerDatabase:
+    """
+    Database-backed speaker storage using Supabase.
+    
+    Replaces in-memory storage for production use.
+    Supports horizontal scaling and persistence across restarts.
+    """
+    
+    def __init__(self):
+        self.supabase_url = settings.SUPABASE_URL
+        self.supabase_key = settings.SUPABASE_SERVICE_ROLE_KEY
+        self._client = None
+    
+    @property
+    def client(self):
+        """Lazy-load Supabase client."""
+        if self._client is None:
+            from supabase import create_client
+            self._client = create_client(self.supabase_url, self.supabase_key)
+        return self._client
+    
+    async def get_speakers(self, org_id: str) -> Dict[str, np.ndarray]:
+        """Get all speakers for an organization."""
+        try:
+            result = self.client.table("speaker_embeddings")\
+                .select("speaker_id, embedding")\
+                .eq("org_id", org_id)\
+                .execute()
+            
+            speakers = {}
+            for row in result.data:
+                embedding = np.array(row["embedding"], dtype=np.float32)
+                speakers[row["speaker_id"]] = embedding
+            
+            return speakers
+        except Exception as e:
+            logger.error("failed_to_load_speakers", org_id=org_id, error=str(e))
+            return {}
+    
+    async def store_speaker(self, org_id: str, speaker_id: str, 
+                           embedding: np.ndarray) -> bool:
+        """Store or update a speaker embedding."""
+        try:
+            self.client.table("speaker_embeddings").upsert({
+                "org_id": org_id,
+                "speaker_id": speaker_id,
+                "embedding": embedding.tolist(),
+                "updated_at": datetime.now().isoformat()
+            }).execute()
+            return True
+        except Exception as e:
+            logger.error("failed_to_store_speaker", 
+                        org_id=org_id, speaker_id=speaker_id, error=str(e))
+            return False
+
+
+# Global speaker database instance
+_speaker_db = SpeakerDatabase()
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -334,8 +394,16 @@ async def match_speaker(
         ... else:
         ...     print("Unknown speaker")
     """
-    # Get organization's speaker database
-    org_speakers = _speaker_db.get(org_id, {})
+    # SECURITY: Enforce minimum threshold to prevent "match everything" attacks
+    MINIMUM_THRESHOLD = 0.5
+    if threshold < MINIMUM_THRESHOLD:
+        logger.warning("threshold_too_low_enforced", 
+                      requested=threshold, 
+                      enforced=MINIMUM_THRESHOLD)
+        threshold = MINIMUM_THRESHOLD
+    
+    # Get organization's speaker database from persistent storage
+    org_speakers = await _speaker_db.get_speakers(org_id)
     
     if not org_speakers:
         logger.info(
