@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Database, Mail, Link2, FileText, Activity, ChevronLeft } from 'lucide-react';
 
-const CortexPanel = ({ onIngest }) => {
+const CortexPanel = ({ apiUrl, onIngest }) => {
     const [isConnecting, setIsConnecting] = useState(false);
     const [logs, setLogs] = useState([]);
     const [isOpen, setIsOpen] = useState(false);
@@ -18,7 +18,7 @@ const CortexPanel = ({ onIngest }) => {
         formData.append('file', file);
 
         try {
-            const response = await fetch('http://localhost:8000/ingest', {
+            const response = await fetch(`${apiUrl || ''}/ingest`, {
                 method: 'POST',
                 body: formData
             });
