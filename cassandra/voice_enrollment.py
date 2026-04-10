@@ -18,6 +18,7 @@ import io
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Optional, Dict, Any, List
 
 import numpy as np
@@ -129,29 +130,30 @@ class VoiceEnrollmentManager:
     
     async def _extract_embedding(self, audio_data: bytes) -> Optional[List[float]]:
         """
-        Extract voice embedding from audio.
+        Extract voice embedding from audio using pyannote.
         
         Args:
             audio_data: Audio bytes
             
         Returns:
-            Embedding vector or None if extraction fails
+            512-dimensional embedding vector or None if extraction fails
         """
-        # This would integrate with actual speaker embedding model
-        # For now, return a placeholder
-        
         try:
-            # Placeholder: Generate random embedding
-            # In production, use actual speaker embedding model
-            embedding = np.random.randn(256).tolist()
-            return embedding
+            # Import speaker_id module for real embedding extraction
+            from cassandra.speaker_id import extract_embedding
+            
+            # Extract real embedding using pyannote/wespeaker
+            embedding = await extract_embedding(audio_data)
+            
+            # Convert to list for storage
+            return embedding.tolist()
         except Exception as e:
             logger.error("embedding_extraction_failed", error=str(e))
             return None
     
     async def _calculate_quality_score(self, audio_data: bytes) -> float:
         """
-        Calculate audio quality score.
+        Calculate audio quality score based on audio characteristics.
         
         Args:
             audio_data: Audio bytes
@@ -159,16 +161,66 @@ class VoiceEnrollmentManager:
         Returns:
             Quality score (0.0 - 1.0)
         """
-        # Placeholder quality calculation
-        # In production, analyze SNR, clipping, background noise, etc.
-        
-        min_length = 16000 * 2 * 3  # 3 seconds at 16kHz, 16-bit
-        
-        if len(audio_data) < min_length:
-            return 0.3  # Too short
-        
-        # Simulate quality check
-        return 0.85
+        try:
+            import numpy as np
+            
+            # Convert bytes to numpy array (assuming 16-bit PCM)
+            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+            
+            # Calculate audio duration in seconds (16kHz, 16-bit mono)
+            duration_sec = len(audio_array) / 16000
+            
+            # Duration score (ideal: 5-10 seconds)
+            if duration_sec < 3:
+                duration_score = 0.3
+            elif duration_sec < 5:
+                duration_score = 0.6
+            elif duration_sec <= 10:
+                duration_score = 1.0
+            else:
+                duration_score = 0.8  # Very long samples may have fatigue
+            
+            # Calculate RMS energy
+            rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+            
+            # RMS score (ideal range: 500-5000 for 16-bit)
+            if rms < 100:
+                rms_score = 0.2  # Too quiet
+            elif rms < 500:
+                rms_score = 0.5
+            elif rms <= 5000:
+                rms_score = 1.0  # Good level
+            elif rms <= 10000:
+                rms_score = 0.7
+            else:
+                rms_score = 0.3  # Likely clipped
+            
+            # Calculate zero-crossing rate (proxy for noise)
+            zero_crossings = np.sum(np.diff(np.signbit(audio_array).astype(int)) != 0)
+            zcr = zero_crossings / len(audio_array)
+            
+            # ZCR score (speech typically 0.05-0.15)
+            if zcr < 0.02:
+                zcr_score = 0.4  # Too little variation (maybe silence)
+            elif zcr <= 0.2:
+                zcr_score = 1.0  # Good speech characteristics
+            else:
+                zcr_score = 0.5  # High noise or music
+            
+            # Combined score
+            quality_score = (duration_score * 0.4 + rms_score * 0.4 + zcr_score * 0.2)
+            
+            logger.debug("quality_score_calculated", 
+                        duration=duration_sec, 
+                        rms=float(rms), 
+                        zcr=float(zcr),
+                        score=quality_score)
+            
+            return round(quality_score, 2)
+            
+        except Exception as e:
+            logger.error("quality_calculation_failed", error=str(e))
+            return 0.5  # Default to medium quality on error
     
     async def enroll(self, input_data: VoiceEnrollmentInput) -> VoiceEnrollmentResult:
         """
