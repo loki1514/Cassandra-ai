@@ -762,6 +762,12 @@ class ContextFetcher:
                 db1_ticket_id = map_row["db1_ticket_id"]
                 db1_table = map_row["db1_table"]
                 
+                # SECURITY: Validate db1_table against allowlist to prevent SQL injection
+                ALLOWED_TABLES = {"tickets", "checklists", "assets", "properties", "vendors"}
+                if db1_table not in ALLOWED_TABLES:
+                    logger.error(f"Invalid db1_table value: {db1_table}")
+                    return None
+                
                 # Query DB1 for authoritative ticket data
                 # Note: DB1 schema may vary, this is a generic implementation
                 ticket_row = await conn.fetchrow(
