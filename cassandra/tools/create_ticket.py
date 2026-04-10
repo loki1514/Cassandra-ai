@@ -283,8 +283,9 @@ class CreateTicketTool:
                 return None
         except Exception as e:
             logger.error(f"Idempotency check failed: {e}")
-            # Fail open - allow creation if check fails
-            return None
+            # SECURITY: Fail closed - raise exception on DB errors
+            # Prevents duplicate ticket creation when idempotency check fails
+            raise RuntimeError(f"Idempotency check failed, cannot proceed: {e}") from e
     
     async def create(
         self,
