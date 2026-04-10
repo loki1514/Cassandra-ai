@@ -1,0 +1,144 @@
+# ============================================
+# Cassandra AI - Docker Compose Configuration
+# ============================================
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # FastAPI Backend
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: cassandra-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - PORT=8000
+      - WORKERS=2
+      - LOG_LEVEL=INFO
+      # Database
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_NAME=${DB_NAME:-postgres}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_SSL_MODE=require
+      # Supabase
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      # AWS
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_KMS_KEY_ALIAS_PREFIX=${AWS_KMS_KEY_ALIAS_PREFIX:-alias/cassandra-org}
+      # AssemblyAI
+      - ASSEMBLYAI_API_KEY=${ASSEMBLYAI_API_KEY}
+      - ASSEMBLYAI_WEBHOOK_SECRET=${ASSEMBLYAI_WEBHOOK_SECRET}
+      # OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4}
+      # Vector Store
+      - VECTOR_PROVIDER=${VECTOR_PROVIDER:-pinecone}
+      - VECTOR_API_KEY=${VECTOR_API_KEY}
+      - VECTOR_INDEX_NAME=${VECTOR_INDEX_NAME:-cassandra-memories}
+      # Security
+      - SECURITY_JWT_ALGORITHM=${SECURITY_JWT_ALGORITHM:-HS256}
+      - SECURITY_JWT_EXPIRATION_HOURS=${SECURITY_JWT_EXPIRATION_HOURS:-24}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - cassandra-network
+
+  # ---------------------------------------------------------------------------
+  # Development Service (with hot reload)
+  # ---------------------------------------------------------------------------
+  api-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: cassandra-api-dev
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - PORT=8000
+      - RELOAD=true
+      - LOG_LEVEL=DEBUG
+    env_file:
+      - .env
+    volumes:
+      - ./cassandra:/app/cassandra
+      - ./tests:/app/tests
+    networks:
+      - cassandra-network
+    profiles:
+      - dev
+
+  # ---------------------------------------------------------------------------
+  # Redis Cache (optional)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: cassandra-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - cassandra-network
+    profiles:
+      - cache
+      - full
+
+  # ---------------------------------------------------------------------------
+  # Test Runner
+  # ---------------------------------------------------------------------------
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: cassandra-test
+    environment:
+      - ENVIRONMENT=test
+      - DEBUG=true
+    env_file:
+      - .env
+    volumes:
+      - ./tests:/app/tests
+      - ./cassandra:/app/cassandra
+    command: pytest tests/ -v --cov=cassandra --cov-report=term-missing
+    networks:
+      - cassandra-network
+    profiles:
+      - test
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  cassandra-network:
+    driver: bridge
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  redis-data:
