@@ -416,8 +416,9 @@ class IdempotencyStore:
                     
         except Exception as e:
             logger.error(f"Idempotency check failed: {e}")
-            # On error, allow processing (fail open)
-            return True, idempotency_key
+            # SECURITY: Fail closed - reject processing on DB errors
+            # This prevents duplicate ticket creation when idempotency check fails
+            return False, idempotency_key
     
     async def mark_processing(self, idempotency_key: str) -> bool:
         """
