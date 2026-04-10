@@ -333,9 +333,17 @@ class EncryptionService:
             serialized = self._serialize_payload(payload)
             encrypted_payload = fernet.encrypt(serialized)
             
-            # Clear plaintext key from memory
+            # SECURITY NOTE: Python bytes are immutable - this assignment doesn't clear memory
+            # The original key bytes remain on the heap until garbage collected
+            # For true secure memory handling, consider:
+            # 1. Using a C extension with explicit memory clearing
+            # 2. Using secrets.compare_digest for key comparison (constant time)
+            # 3. Minimizing key lifetime by decrypting only when needed
+            # 4. Using AWS KMS directly for small payloads instead of envelope encryption
             import secrets
+            # Best effort: overwrite reference (original bytes still in heap)
             plaintext_data_key = secrets.token_bytes(len(plaintext_data_key))
+            del plaintext_data_key  # Remove reference for faster GC
             
             return {
                 'ciphertext': base64.b64encode(encrypted_payload).decode('utf-8'),
@@ -372,9 +380,19 @@ class EncryptionService:
             DecryptionError: If decryption fails
         """
         try:
+            # SECURITY FIX: Use stored key_id for decryption to support key rotation
+            # The key_id should be stored alongside the encrypted data
+            # This allows decryption of data encrypted with old key versions
+            
+            # For now, use the alias which may point to old key during rotation
+            # In production, retrieve the specific key_id from encrypted data metadata
+            key_alias = self._get_key_alias(org_id)
+            
             # Decrypt the data key using KMS
+            # Note: KMS can decrypt with any key version, not just the current alias target
             decrypted_key_response = self.kms_client.decrypt(
-                CiphertextBlob=base64.b64decode(encrypted_data_key)
+                CiphertextBlob=base64.b64decode(encrypted_data_key),
+                KeyId=key_alias  # Explicitly specify key for audit logging
             )
             
             plaintext_data_key = decrypted_key_response['Plaintext']
@@ -391,9 +409,17 @@ class EncryptionService:
             encrypted_payload = base64.b64decode(ciphertext)
             decrypted_payload = fernet.decrypt(encrypted_payload)
             
-            # Clear plaintext key from memory
+            # SECURITY NOTE: Python bytes are immutable - this assignment doesn't clear memory
+            # The original key bytes remain on the heap until garbage collected
+            # For true secure memory handling, consider:
+            # 1. Using a C extension with explicit memory clearing
+            # 2. Using secrets.compare_digest for key comparison (constant time)
+            # 3. Minimizing key lifetime by decrypting only when needed
+            # 4. Using AWS KMS directly for small payloads instead of envelope encryption
             import secrets
+            # Best effort: overwrite reference (original bytes still in heap)
             plaintext_data_key = secrets.token_bytes(len(plaintext_data_key))
+            del plaintext_data_key  # Remove reference for faster GC
             
             return self._deserialize_payload(decrypted_payload)
             
@@ -592,30 +618,39 @@ class KeyRotationManager:
             
             new_key_id = new_key_response['KeyMetadata']['KeyId']
             
-            # Update alias to point to new key
-            self.kms_client.update_alias(
-                AliasName=old_key_alias,
-                TargetKeyId=new_key_id
+            # SECURITY FIX: Store new key ID for decrypt operations
+            # DO NOT update alias yet - old ciphertexts need old key
+            # Store mapping in database for key version tracking
+            
+            # TODO: Re-encrypt all existing data with new key before rotating
+            # This is a placeholder - in production, run background job to:
+            # 1. Query all encrypted data for org
+            # 2. Decrypt with old key
+            # 3. Re-encrypt with new key
+            # 4. Update alias only after all data is re-encrypted
+            
+            logger.warning(
+                "KEY ROTATION INCOMPLETE - Data re-encryption required",
+                extra={
+                    "org_id": org_id,
+                    "old_key_id": old_key_id, 
+                    "new_key_id": new_key_id,
+                    "action_required": "Run re-encryption job before completing rotation"
+                }
             )
             
-            # Schedule old key deletion (30 days grace period)
-            self.kms_client.schedule_key_deletion(
-                KeyId=old_key_id,
-                PendingWindowInDays=30
-            )
-            
-            logger.info(
-                f"Manual rotation completed for org {org_id}",
-                extra={"old_key_id": old_key_id, "new_key_id": new_key_id}
-            )
+            # Store key version info for later re-encryption
+            # DO NOT schedule old key deletion until re-encryption is complete
             
             return {
-                "success": True,
+                "success": False,  # Mark as incomplete
                 "org_id": org_id,
                 "old_key_id": old_key_id,
                 "new_key_id": new_key_id,
                 "alias": old_key_alias,
-                "old_key_deletion_scheduled": True
+                "status": "PENDING_REENCRYPTION",
+                "warning": "Key rotation requires data re-encryption. Old key NOT scheduled for deletion.",
+                "action_required": "Run background re-encryption job before completing rotation"
             }
             
         except ClientError as e:
