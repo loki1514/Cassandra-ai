@@ -498,5 +498,82 @@ def get_commitments_needing_review(
     return [c for c in commitments if c.requires_review]
 
 
+# =============================================================================
+# Ticket Data Extraction (for main.py integration)
+# =============================================================================
+
+async def extract_ticket_data(transcript: str, speaker_context: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Extract ticket data from transcript for automatic ticket creation.
+    
+    This is the main entry point for the voice pipeline to extract
+    actionable ticket information from conversation transcripts.
+    
+    Args:
+        transcript: Full conversation transcript
+        speaker_context: Optional speaker identification context
+        
+    Returns:
+        Dictionary with extracted ticket data:
+        {
+            "title": str,
+            "description": str,
+            "assignee": str | None,
+            "deadline": str | None,
+            "priority": str,
+            "confidence": float,
+            "source_transcript": str
+        }
+    """
+    logger.info("extracting_ticket_data", transcript_length=len(transcript))
+    
+    # Extract commitments from transcript
+    commitments = await extract_commitments(transcript)
+    
+    if not commitments:
+        logger.warning("no_commitments_extracted")
+        return {
+            "title": "Voice Command Follow-up",
+            "description": f"Transcript: {transcript[:200]}...",
+            "assignee": None,
+            "deadline": None,
+            "priority": "medium",
+            "confidence": 0.5,
+            "source_transcript": transcript
+        }
+    
+    # Use highest confidence commitment for ticket
+    best_commitment = max(commitments, key=lambda c: c.confidence)
+    
+    # Build ticket data
+    ticket_data = {
+        "title": best_commitment.commitment_text[:100],
+        "description": f"""
+Extracted from voice conversation:
+- Speaker: {best_commitment.speaker_id}
+- Original text: {best_commitment.raw_text}
+- Full transcript excerpt: {transcript[:500]}...
+
+All extracted commitments:
+""".strip() + "\n" + "\n".join([
+            f"- [{c.speaker_id}] {c.commitment_text} (confidence: {c.confidence:.2f})"
+            for c in commitments
+        ]),
+        "assignee": best_commitment.speaker_id if best_commitment.speaker_id != "unknown" else None,
+        "deadline": best_commitment.deadline_date,
+        "priority": "high" if best_commitment.confidence > 0.8 else "medium",
+        "confidence": best_commitment.confidence,
+        "source_transcript": transcript,
+        "extracted_commitments": [c.to_dict() for c in commitments]
+    }
+    
+    logger.info("ticket_data_extracted", 
+                title=ticket_data["title"],
+                confidence=ticket_data["confidence"],
+                commitment_count=len(commitments))
+    
+    return ticket_data
+
+
 # Import asyncio for batch processing
 import asyncio
