@@ -735,8 +735,9 @@ class IdempotencyStore:
                 
         except Exception as e:
             logger.error(f"Memory archive idempotency check failed: {e}")
-            # Fail open - allow processing if check fails
-            return True, None, None
+            # SECURITY: Fail closed - reject processing on DB errors
+            # This prevents duplicate memory writes when idempotency check fails
+            return False, None, None
     
     async def write_memory_with_idempotency(
         self,

@@ -21,18 +21,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class DatabaseSettings(BaseSettings):
-    """Database connection settings."""
-    
+    """Database connection settings.
+
+    Note: All actual database operations go through Supabase REST API
+    (via cassandra/supabase.py), not direct Postgres connections.
+    These settings exist for optional direct DB access if needed.
+    """
+
     model_config = SettingsConfigDict(
         env_prefix="DB_",
-        extra="ignore"
+        extra="ignore",
+        env_file=".env",
+        env_file_encoding="utf-8",
     )
-    
+
     host: str = Field(default="localhost", description="Database host")
     port: int = Field(default=5432, description="Database port")
     name: str = Field(default="cassandra", description="Database name")
     user: str = Field(default="postgres", description="Database user")
-    password: str = Field(..., description="Database password (required)")
+    password: str = Field(default="", description="Database password (optional — Supabase handles auth)")
     ssl_mode: str = Field(default="require", description="SSL mode for connection")
     pool_size: int = Field(default=10, description="Connection pool size")
     max_overflow: int = Field(default=20, description="Max pool overflow")
@@ -121,6 +128,24 @@ class AssemblyAISettings(BaseSettings):
     )
 
 
+class ElevenLabsSettings(BaseSettings):
+    """ElevenLabs TTS settings."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="ELEVENLABS_",
+        extra="ignore"
+    )
+
+    api_key: str = Field(default="", description="ElevenLabs API key")
+    default_voice: str = Field(default="alloy", description="Default voice ID or name")
+    model: str = Field(default="eleven_multilingual_v2", description="TTS model")
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if ElevenLabs is configured with a valid API key."""
+        return bool(self.api_key)
+
+
 class OpenAISettings(BaseSettings):
     """OpenAI API settings."""
     
@@ -138,6 +163,62 @@ class OpenAISettings(BaseSettings):
     )
     max_tokens: int = Field(default=2000, description="Max tokens for completions")
     temperature: float = Field(default=0.7, description="Temperature for completions")
+
+
+class SupermemorySettings(BaseSettings):
+    """Supermemory conversational memory service settings."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SUPERMEMORY_",
+        extra="ignore"
+    )
+
+    api_url: str = Field(
+        default="https://api.supermemory.ai",
+        description="Supermemory API base URL"
+    )
+    api_key: Optional[str] = Field(
+        default=None,
+        description="Supermemory API key"
+    )
+    org_id_header: str = Field(
+        default="x-org-id",
+        description="HTTP header name for org_id"
+    )
+    search_endpoint: str = Field(
+        default="/search",
+        description="Search endpoint path"
+    )
+    timeout_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        description="Request timeout in seconds"
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if Supermemory is configured with credentials."""
+        return bool(self.api_key and self.api_url)
+
+
+class AuthSettings(BaseSettings):
+    """Authentication settings for Cassandra session tokens and FMS JWT verification."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        extra="ignore"
+    )
+
+    cassandra_token_secret: str = Field(
+        description="Generate: python3 -c \"import secrets; print(secrets.token_hex(64))\""
+    )
+    cassandra_token_expire_seconds: int = Field(default=21600, ge=60)
+    fms_supabase_url: str = Field(
+        description="FMS Supabase project URL (e.g. https://abc123.supabase.co). "
+                    "This is the Supabase that authenticates the React console admin, "
+                    "NOT the Cassandra database."
+    )
 
 
 class VectorStoreSettings(BaseSettings):
@@ -254,11 +335,14 @@ class AppSettings(BaseSettings):
     supabase: SupabaseSettings = Field(default_factory=SupabaseSettings)
     aws: AWSSettings = Field(default_factory=AWSSettings)
     assemblyai: AssemblyAISettings = Field(default_factory=AssemblyAISettings)
+    elevenlabs: ElevenLabsSettings = Field(default_factory=ElevenLabsSettings)
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     vector: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    supermemory: SupermemorySettings = Field(default_factory=SupermemorySettings)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
     
     @field_validator('environment')
     @classmethod
@@ -311,4 +395,8 @@ def reload_settings() -> AppSettings:
 
 
 # Convenience exports
+# Load .env file before settings to ensure all sub-models pick up env vars.
+# Sub-models use env_prefix but don't inherit env_file from AppSettings in pydantic-settings v2.
+from dotenv import load_dotenv
+load_dotenv(override=True)
 settings = get_settings()

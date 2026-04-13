@@ -7,6 +7,9 @@ from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 import re
 
+from cassandra.rag.context_fetcher import fetch_full_context, ContextResult
+from cassandra.supabase import get_supabase_client
+
 
 class VoiceRescheduleProcessor:
     """
@@ -30,6 +33,14 @@ class VoiceRescheduleProcessor:
         Returns:
             Reschedule result with confirmation
         """
+        # Step 0: Fetch dual-read context to check for verbal mentions of rescheduling
+        context = await fetch_full_context(
+            query=audio_text,
+            org_id=org_id,
+            data_hints=["tickets"],
+            top_k=5
+        )
+
         # Step 1: Parse reschedule intent
         reschedule = self._parse_reschedule(audio_text)
         
@@ -166,17 +177,34 @@ class VoiceRescheduleProcessor:
         return None
     
     async def _find_ticket(self, reference: str, org_id: str) -> Optional[Dict[str, Any]]:
-        """Find ticket by reference."""
-        query = """
-            SELECT id, title, deadline, assigned_to, status
-            FROM tickets 
-            WHERE (id = $1 OR title ILIKE $2 OR ticket_number = $1)
-            AND org_id = $3
-            AND status != 'archived'
-            LIMIT 1
-        """
-        result = await self.backend_api.db.fetchrow(query, reference, f"%{reference}%", org_id)
-        return dict(result) if result else None
+        """Find ticket by reference using Supabase with org_id enforcement."""
+        client = get_supabase_client("service")
+
+        # Try exact match on id or ticket_number
+        result = (
+            client.table("tickets")
+            .select("id, title, deadline, assigned_to, status")
+            .eq("org_id", org_id)
+            .or_(f"id.eq.{reference},ticket_number.eq.{reference}")
+            .execute()
+        )
+        for row in result.data:
+            if row.get("status") != "archived":
+                return row
+
+        # Fallback: ILIKE on title
+        result2 = (
+            client.table("tickets")
+            .select("id, title, deadline, assigned_to, status")
+            .eq("org_id", org_id)
+            .ilike("title", f"%{reference}%")
+            .execute()
+        )
+        for row in result2.data:
+            if row.get("status") != "archived":
+                return row
+
+        return None
     
     async def _log_reschedule_event(self, ticket: Dict, old_deadline: Optional[datetime],
                                     new_deadline: datetime, speaker_context: Dict, 

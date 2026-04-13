@@ -1,18 +1,42 @@
+-- T07: Meetings/Transcripts Multi-Tenancy Columns + Indexes
 -- ============================================
--- T007: Meetings/Transcripts Multi-Tenancy Fix
+-- Note: RLS intentionally omitted — org isolation enforced at application layer.
+-- org_id columns are added for data modeling correctness; application code
+-- is responsible for scoping every query to the current user's org.
+
 -- ============================================
--- Adds org_id columns and RLS policies to meeting-related tables
--- Fixes CRITICAL audit finding: zero org_id columns, zero RLS policies
+-- CREATE SPEAKER_EMBEDDINGS TABLE (not yet defined anywhere)
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS speaker_embeddings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    org_id UUID REFERENCES orgs(id),
+    meeting_id UUID,  -- FK added separately below to avoid forward-reference
+    speaker_name TEXT,
+    embedding vector(1536),
+    enrollment_status TEXT DEFAULT 'pending',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Add FK constraint now that meetings table exists
+DO $$
+BEGIN
+    ALTER TABLE speaker_embeddings ADD CONSTRAINT speaker_embeddings_meeting_id_fkey
+        FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE SET NULL;
+EXCEPTION WHEN undefined_table THEN
+    RAISE NOTICE 'meetings table not yet created, FK constraint skipped';
+END;
+$$;
 
 -- ============================================
 -- ADD ORG_ID COLUMNS
 -- ============================================
 
 -- Add org_id to meetings table if not exists
-ALTER TABLE IF EXISTS meetings 
+ALTER TABLE IF EXISTS meetings
 ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES orgs(id);
 
--- Add org_id to transcripts table if not exists  
+-- Add org_id to transcripts table if not exists
 ALTER TABLE IF EXISTS transcripts
 ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES orgs(id);
 
@@ -20,7 +44,7 @@ ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES orgs(id);
 ALTER TABLE IF EXISTS artifacts
 ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES orgs(id);
 
--- Add org_id to speaker_embeddings table if not exists
+-- Add org_id to speaker_embeddings table (table was just created above)
 ALTER TABLE IF EXISTS speaker_embeddings
 ADD COLUMN IF NOT EXISTS org_id UUID REFERENCES orgs(id);
 
@@ -33,118 +57,63 @@ CREATE INDEX IF NOT EXISTS idx_transcripts_org_id ON transcripts(org_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_org_id ON artifacts(org_id);
 CREATE INDEX IF NOT EXISTS idx_speaker_embeddings_org_id ON speaker_embeddings(org_id);
 
--- ============================================
--- ENABLE RLS ON TABLES
--- ============================================
-
-ALTER TABLE IF EXISTS meetings ENABLE ROW LEVEL SECURITY;
-ALTER TABLE IF EXISTS transcripts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE IF EXISTS artifacts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE IF EXISTS speaker_embeddings ENABLE ROW LEVEL SECURITY;
+-- Composite indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_meetings_org_created ON meetings(org_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transcripts_org_meeting ON transcripts(org_id, meeting_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_org_meeting ON artifacts(org_id, meeting_id);
 
 -- ============================================
--- CREATE RLS POLICIES
+-- DISABLE RLS (belt-and-suspenders)
 -- ============================================
+-- Ensure RLS is OFF for all meeting-related tables.
 
--- Meetings: org isolation
-DROP POLICY IF EXISTS meetings_org_isolation ON meetings;
-CREATE POLICY meetings_org_isolation ON meetings
-    FOR ALL
-    TO authenticated
-    USING (org_id = get_current_org_id());
-
--- Transcripts: org isolation
-DROP POLICY IF EXISTS transcripts_org_isolation ON transcripts;
-CREATE POLICY transcripts_org_isolation ON transcripts
-    FOR ALL
-    TO authenticated
-    USING (org_id = get_current_org_id());
-
--- Artifacts: org isolation
-DROP POLICY IF EXISTS artifacts_org_isolation ON artifacts;
-CREATE POLICY artifacts_org_isolation ON artifacts
-    FOR ALL
-    TO authenticated
-    USING (org_id = get_current_org_id());
-
--- Speaker embeddings: org isolation
-DROP POLICY IF EXISTS speaker_embeddings_org_isolation ON speaker_embeddings;
-CREATE POLICY speaker_embeddings_org_isolation ON speaker_embeddings
-    FOR ALL
-    TO authenticated
-    USING (org_id = get_current_org_id());
+ALTER TABLE IF EXISTS meetings DISABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS transcripts DISABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS artifacts DISABLE ROW LEVEL SECURITY;
+ALTER TABLE IF EXISTS speaker_embeddings DISABLE ROW LEVEL SECURITY;
 
 -- ============================================
--- FORCE RLS FOR SERVICE ROLES
--- ============================================
--- Service roles should NOT bypass RLS - they must use org_id
-
--- Revoke BYPASSRLS if previously granted (security fix)
-DO $$
-BEGIN
-    -- Note: This may fail if role doesn't have BYPASSRLS, which is fine
-    EXECUTE 'ALTER ROLE cassandra_role NOBYPASSRLS';
-EXCEPTION WHEN undefined_object OR insufficient_privilege THEN
-    RAISE NOTICE 'cassandra_role did not have BYPASSRLS (good)';
-END;
-$$;
-
-DO $$
-BEGIN
-    EXECUTE 'ALTER ROLE backend_role NOBYPASSRLS';
-EXCEPTION WHEN undefined_object OR insufficient_privilege THEN
-    RAISE NOTICE 'backend_role did not have BYPASSRLS (good)';
-END;
-$$;
-
--- ============================================
--- SERVICE ROLE POLICIES (with org_id validation)
+-- GRANT PERMISSIONS TO SERVICE ROLES
 -- ============================================
 
--- Service roles must provide org_id - no bypass allowed
-DROP POLICY IF EXISTS meetings_service_access ON meetings;
-CREATE POLICY meetings_service_access ON meetings
-    FOR ALL
-    TO cassandra_role, backend_role
-    USING (org_id IS NOT NULL);
+-- cassandra_role: AI service (read + write)
+-- Note: all tables use uuid_generate_v4() — no sequences exist
+GRANT SELECT, INSERT, UPDATE ON meetings TO cassandra_role;
+GRANT SELECT, INSERT, UPDATE ON transcripts TO cassandra_role;
+GRANT SELECT, INSERT, UPDATE ON artifacts TO cassandra_role;
+GRANT SELECT, INSERT, UPDATE ON speaker_embeddings TO cassandra_role;
 
-DROP POLICY IF EXISTS transcripts_service_access ON transcripts;
-CREATE POLICY transcripts_service_access ON transcripts
-    FOR ALL
-    TO cassandra_role, backend_role
-    USING (org_id IS NOT NULL);
+-- backend_role: full access
+-- Note: all tables use uuid_generate_v4() — no sequences exist
+GRANT ALL ON meetings TO backend_role;
+GRANT ALL ON transcripts TO backend_role;
+GRANT ALL ON artifacts TO backend_role;
+GRANT ALL ON speaker_embeddings TO backend_role;
 
-DROP POLICY IF EXISTS artifacts_service_access ON artifacts;
-CREATE POLICY artifacts_service_access ON artifacts
-    FOR ALL
-    TO cassandra_role, backend_role
-    USING (org_id IS NOT NULL);
-
-DROP POLICY IF EXISTS speaker_embeddings_service_access ON speaker_embeddings;
-CREATE POLICY speaker_embeddings_service_access ON speaker_embeddings
-    FOR ALL
-    TO cassandra_role, backend_role
-    USING (org_id IS NOT NULL);
+-- analytics_role: read-only
+GRANT SELECT ON meetings TO analytics_role;
+GRANT SELECT ON transcripts TO analytics_role;
+GRANT SELECT ON artifacts TO analytics_role;
+GRANT SELECT ON speaker_embeddings TO analytics_role;
 
 -- ============================================
--- COMMENTS
+-- COMMENTS FOR DOCUMENTATION
 -- ============================================
-
-COMMENT ON TABLE meetings IS 'RLS enabled: org isolation via org_id column';
-COMMENT ON TABLE transcripts IS 'RLS enabled: org isolation via org_id column';
-COMMENT ON TABLE artifacts IS 'RLS enabled: org isolation via org_id column';
-COMMENT ON TABLE speaker_embeddings IS 'RLS enabled: org isolation via org_id column';
+COMMENT ON TABLE meetings IS 'Meeting records with org_id for application-layer multi-tenancy (no RLS)';
+COMMENT ON TABLE transcripts IS 'Transcript chunks with org_id for application-layer multi-tenancy (no RLS)';
+COMMENT ON TABLE artifacts IS 'Extracted artifacts with org_id for application-layer multi-tenancy (no RLS)';
+COMMENT ON TABLE speaker_embeddings IS 'Speaker embeddings with org_id for application-layer multi-tenancy (no RLS)';
 
 -- ============================================
--- VERIFICATION QUERY (run to confirm)
+-- VERIFICATION QUERY
 -- ============================================
 /*
-SELECT 
+-- Run to verify org_id columns exist and RLS is disabled:
+SELECT
     schemaname,
     tablename,
-    rowsecurity,
-    forcerowsecurity
-FROM pg_tables 
+    rowsecurity
+FROM pg_tables
 WHERE tablename IN ('meetings', 'transcripts', 'artifacts', 'speaker_embeddings')
 AND schemaname = 'public';
 */

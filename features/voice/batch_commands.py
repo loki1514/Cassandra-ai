@@ -7,6 +7,8 @@ import asyncio
 from typing import List, Dict, Any
 from pydantic import BaseModel
 
+from cassandra.rag.context_fetcher import fetch_full_context, ContextResult
+
 
 class BatchCommand(BaseModel):
     """Single command from a batch."""
@@ -108,10 +110,23 @@ class BatchTicketProcessor:
         
         return [text] if text else []
     
-    async def _process_single_command(self, command: str, org_id: str, 
-                                     context: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a single command from the batch."""
-        return await self.nl_processor.process_voice_command(command, org_id, context)
+    async def _process_single_command(self, command: str, org_id: str,
+                                     speaker_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a single command from the batch, enriched with dual-read context."""
+        # Fetch dual-read context for this specific command
+        dual_context = await fetch_full_context(
+            query=command,
+            org_id=org_id,
+            data_hints=["tickets"],
+            top_k=3
+        )
+        # Enrich speaker_context with the fetched context
+        enriched_context = {
+            **speaker_context,
+            "dual_context_supabase": dual_context.supabase_rows,
+            "dual_context_memory": dual_context.memory_chunks,
+        }
+        return await self.nl_processor.process_voice_command(command, org_id, enriched_context)
     
     def _generate_batch_confirmation(self, successful: List[Dict], 
                                     failed: List[Dict]) -> str:

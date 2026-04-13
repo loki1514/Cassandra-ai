@@ -276,10 +276,12 @@ class VoiceEnrollmentManager:
                 continue
             
             # Create sample record
+            # Use 16kHz PCM16 assumption for duration estimate
+            # (2 bytes/sample * 16000 samples/sec = 32 bytes/ms)
             sample = VoiceSample(
                 sample_id=f"{profile_id}_sample_{i}",
                 audio_data=audio_data,
-                duration_ms=len(audio_data) // 32,  # Approximate
+                duration_ms=len(audio_data) // 32,
                 quality_score=quality,
                 created_at=datetime.utcnow()
             )

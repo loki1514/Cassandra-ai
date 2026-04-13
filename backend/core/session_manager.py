@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable, Awaitable
 
 from fastapi import WebSocket
 
@@ -34,7 +34,7 @@ from backend.core.exceptions import (
 )
 from backend.utils.logging_config import SessionLogger
 
-logger = SessionLogger(name="cassandra.session_manager")
+logger = SessionLogger(logger_name="cassandra.session_manager")
 
 
 class SessionState(str, Enum):
@@ -134,6 +134,10 @@ class SessionContext:
     # Logger (initialized lazily)
     _session_logger: SessionLogger | None = None
 
+    # End-of-session callbacks (fires during end_session cleanup)
+    # Each callback receives (session_id, org_id, user_id, session_stats)
+    _end_callbacks: list[Callable[..., Awaitable[None]]] = field(default_factory=list)
+
     @property
     def sl(self) -> SessionLogger:
         if self._session_logger is None:
@@ -143,6 +147,16 @@ class SessionContext:
                 user_id=self.user_id,
             )
         return self._session_logger
+
+    def add_end_callback(self, callback: Callable[..., Awaitable[None]]) -> None:
+        """
+        Register a callback to be invoked when the session ends.
+
+        Callbacks receive (session_id, org_id, user_id, session_stats_dict)
+        and are invoked during end_session() cleanup — after audio buffer
+        is finalized but before the session is removed from the registry.
+        """
+        self._end_callbacks.append(callback)
 
     def transition_to(self, new_state: SessionState) -> None:
         """Transition to a new state, validating the transition is allowed."""
@@ -190,6 +204,8 @@ class SessionManager:
         session_id: str | None = None,
         meeting_id: str | None = None,
         auth: AuthContext | None = None,
+        org_id: str | None = None,
+        user_id: str | None = None,
         protocol_version: str = "v2",
     ) -> AsyncIterator[SessionContext]:
         """
@@ -198,7 +214,9 @@ class SessionManager:
         Args:
             session_id: Optional session ID (generated if not provided).
             meeting_id: Associated meeting ID.
-            auth: Authentication context.
+            auth: Authentication context (provides org_id/user_id if set).
+            org_id: Organization ID (used if auth not provided).
+            user_id: User ID (used if auth not provided).
             protocol_version: "v1" (legacy) or "v2" (smart).
 
         Yields:
@@ -206,6 +224,10 @@ class SessionManager:
         """
         if session_id is None:
             session_id = f"mtg-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+        # Resolve org_id/user_id: prefer auth context, fall back to direct params
+        resolved_org_id = auth.org_id if auth else (org_id or "legacy")
+        resolved_user_id = auth.user_id if auth else user_id
 
         async with self._lock:
             if session_id in self._sessions:
@@ -216,8 +238,8 @@ class SessionManager:
             ctx = SessionContext(
                 session_id=session_id,
                 meeting_id=meeting_id,
-                org_id=auth.org_id if auth else "legacy",
-                user_id=auth.user_id if auth else None,
+                org_id=resolved_org_id,
+                user_id=resolved_user_id,
                 protocol_version=protocol_version,
                 auth=auth,
             )
@@ -304,13 +326,31 @@ class SessionManager:
                 pass
 
         elapsed = (datetime.utcnow() - ctx.created_at).total_seconds()
+        stats = {
+            "duration_seconds": round(elapsed, 1),
+            "transcript_turns": ctx.transcript_turns,
+            "interrupts_count": ctx.interrupts_count,
+            "tool_calls": ctx.tool_calls,
+            "audio_chunks_received": ctx.audio_chunks_received,
+            "state": ctx.state.value,
+        }
+
+        # Fire end-of-session callbacks (e.g., write memory to Supermemory)
+        for callback in ctx._end_callbacks:
+            try:
+                await callback(session_id, ctx.org_id, ctx.user_id, stats)
+            except Exception as e:
+                logger.error(
+                    "session_end_callback_failed",
+                    session_id=session_id,
+                    callback=repr(callback),
+                    error=str(e),
+                )
+
         ctx.sl.info(
             "session_ended",
             session_id=session_id,
-            duration_seconds=round(elapsed, 1),
-            transcript_turns=ctx.transcript_turns,
-            interrupts_count=ctx.interrupts_count,
-            tool_calls=ctx.tool_calls,
+            **stats,
         )
 
     async def broadcast(

@@ -6,6 +6,9 @@ Update ticket priority, change assignee, fire notifications via voice command.
 from typing import Dict, Any, Optional
 from enum import Enum
 
+from cassandra.rag.context_fetcher import fetch_full_context, ContextResult
+from cassandra.supabase import get_supabase_client
+
 
 class EscalationLevel(str, Enum):
     """Escalation priority levels."""
@@ -40,6 +43,14 @@ class VoiceEscalationProcessor:
         """
         # Step 1: Parse escalation intent
         escalation = self._parse_escalation(audio_text)
+
+        # Step 1b: Fetch dual-read context about this ticket/escalation
+        context = await fetch_full_context(
+            query=f"escalation {audio_text}",
+            org_id=org_id,
+            data_hints=["tickets", "users"],
+            top_k=5
+        )
         
         if not escalation.get('ticket_reference'):
             return {
@@ -77,8 +88,8 @@ class VoiceEscalationProcessor:
                 "message": "Failed to escalate ticket. Please try again."
             }
         
-        # Step 4: Send notifications
-        notification_result = await self._send_notifications(ticket, escalation, org_id)
+        # Step 4: Send notifications with enriched context
+        notification_result = await self._send_notifications(ticket, escalation, org_id, context)
         
         # Step 5: Log to Supermemory
         await self._log_escalation_event(ticket, escalation, speaker_context, org_id)
@@ -196,43 +207,59 @@ class VoiceEscalationProcessor:
         
         return None
     
-    async def _send_notifications(self, ticket: Dict, escalation: Dict, 
-                                  org_id: str) -> Dict[str, Any]:
-        """Send notifications for escalation."""
+    async def _send_notifications(self, ticket: Dict, escalation: Dict,
+                                  org_id: str,
+                                  dual_context: Optional[ContextResult] = None) -> Dict[str, Any]:
+        """Send notifications for escalation, enriched with dual-read context."""
         notifications_sent = 0
-        
+
+        # Build enriched context string for notification body
+        enrichment = ""
+        if dual_context:
+            if dual_context.memory_chunks:
+                top_chunk = dual_context.memory_chunks[0]
+                enrichment = f" | Context: {top_chunk.get('content', '')[:80]}"
+            elif dual_context.supabase_rows:
+                enrichment = f" | Additional Supabase data available."
+
         # Notify new assignee if specified
         if escalation.get('assignee'):
             await self.notifications.send_push(
                 user_id=escalation['assignee'],
-                title="🔴 Escalated Ticket Assigned",
-                body=f"'{ticket['title']}' has been escalated to {escalation['priority']} priority",
+                title="Escalated Ticket Assigned",
+                body=f"'{ticket['title']}' escalated to {escalation['priority']} priority{enrichment}",
                 data={"ticket_id": ticket['id'], "action": "view_ticket"}
             )
             notifications_sent += 1
-        
+
         # Notify site director
         site_director = await self._get_site_director(org_id)
         if site_director:
             await self.notifications.send_push(
                 user_id=site_director,
-                title="🚨 Ticket Escalated",
-                body=f"'{ticket['title']}' escalated to {escalation['priority']}",
+                title="Ticket Escalated",
+                body=f"'{ticket['title']}' escalated to {escalation['priority']}{enrichment}",
                 data={"ticket_id": ticket['id'], "action": "review_escalation"}
             )
             notifications_sent += 1
-        
+
         return {"sent": notifications_sent}
     
     async def _get_site_director(self, org_id: str) -> Optional[str]:
-        """Get site director user ID for org."""
-        query = """
-            SELECT id FROM users 
-            WHERE org_id = $1 AND role = 'site_director' 
-            LIMIT 1
-        """
-        result = await self.backend_api.db.fetchrow(query, org_id)
-        return result['id'] if result else None
+        """Get site director user ID for org via Supabase."""
+        client = get_supabase_client("service")
+        result = (
+            client.table("users")
+            .select("id")
+            .eq("org_id", org_id)
+            .eq("role", "site_director")
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            return result.data[0]["id"]
+        return None
     
     async def _log_escalation_event(self, ticket: Dict, escalation: Dict,
                                     speaker_context: Dict, org_id: str):

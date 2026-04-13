@@ -1,6 +1,6 @@
--- T08: memory_archive Backup Table
--- Stores archived/backup copies of memory data
+-- T06: memory_archive Table + Archive Functions
 -- Created: Phase 1 Foundation
+-- Note: RLS intentionally omitted — org isolation enforced at application layer
 
 -- ============================================
 -- MEMORY_ARCHIVE TABLE
@@ -15,38 +15,39 @@ CREATE TABLE IF NOT EXISTS memory_archive (
     archived_by UUID REFERENCES users(id) ON DELETE SET NULL,
     archive_reason TEXT,
     metadata JSONB DEFAULT '{}',
-    
-    -- Entity type constraint
+
     CONSTRAINT chk_entity_type CHECK (entity_type IN ('memory', 'ticket', 'mapping', 'user', 'custom'))
 );
+
+-- Disable RLS for memory_archive (belt-and-suspenders)
+ALTER TABLE IF EXISTS memory_archive DISABLE ROW LEVEL SECURITY;
 
 -- ============================================
 -- INDEXES FOR EFFICIENT LOOKUPS
 -- ============================================
 
 -- Primary index for org-scoped entity lookups
--- Used when: "Find all archived items for this entity in this org"
-CREATE INDEX IF NOT EXISTS idx_memory_archive_org_entity 
+CREATE INDEX IF NOT EXISTS idx_memory_archive_org_entity
     ON memory_archive(org_id, entity_id);
 
 -- Index for archive time-based queries
-CREATE INDEX IF NOT EXISTS idx_memory_archive_archived_at 
+CREATE INDEX IF NOT EXISTS idx_memory_archive_archived_at
     ON memory_archive(archived_at DESC);
 
 -- Index for entity type filtering
-CREATE INDEX IF NOT EXISTS idx_memory_archive_entity_type 
+CREATE INDEX IF NOT EXISTS idx_memory_archive_entity_type
     ON memory_archive(entity_type);
 
 -- Composite index for org + type queries
-CREATE INDEX IF NOT EXISTS idx_memory_archive_org_type 
+CREATE INDEX IF NOT EXISTS idx_memory_archive_org_type
     ON memory_archive(org_id, entity_type, archived_at DESC);
 
 -- GIN index for JSONB metadata queries
-CREATE INDEX IF NOT EXISTS idx_memory_archive_metadata 
+CREATE INDEX IF NOT EXISTS idx_memory_archive_metadata
     ON memory_archive USING GIN (metadata);
 
 -- GIN index for original_data queries
-CREATE INDEX IF NOT EXISTS idx_memory_archive_original_data 
+CREATE INDEX IF NOT EXISTS idx_memory_archive_original_data
     ON memory_archive USING GIN (original_data);
 
 -- ============================================
@@ -72,11 +73,16 @@ BEGIN
     INTO v_org_id, v_memory_id, v_ticket_id, v_confidence_score
     FROM memory_ticket_map
     WHERE id = p_mapping_id;
-    
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Memory mapping with ID % not found', p_mapping_id;
     END IF;
-    
+
+    -- Validate org access
+    IF NOT validate_org_access(v_org_id) THEN
+        RAISE EXCEPTION 'Access denied: org_id mismatch';
+    END IF;
+
     -- Insert into archive
     INSERT INTO memory_archive (
         org_id,
@@ -105,7 +111,7 @@ BEGIN
         )
     )
     RETURNING id INTO v_archive_id;
-    
+
     RETURN v_archive_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -124,11 +130,16 @@ RETURNS UUID AS $$
 DECLARE
     v_archive_id UUID;
 BEGIN
+    -- Validate org access
+    IF NOT validate_org_access(p_org_id) THEN
+        RAISE EXCEPTION 'Access denied: org_id mismatch';
+    END IF;
+
     -- Validate entity_type
     IF p_entity_type NOT IN ('memory', 'ticket', 'mapping', 'user', 'custom') THEN
         RAISE EXCEPTION 'Invalid entity_type: %. Must be one of: memory, ticket, mapping, user, custom', p_entity_type;
     END IF;
-    
+
     INSERT INTO memory_archive (
         org_id,
         entity_id,
@@ -147,12 +158,12 @@ BEGIN
         p_metadata || jsonb_build_object('archived_at', NOW())
     )
     RETURNING id INTO v_archive_id;
-    
+
     RETURN v_archive_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Function to restore from archive (creates new record, doesn't delete archive)
+-- Function to restore from archive (creates new record, does not delete archive)
 CREATE OR REPLACE FUNCTION restore_from_archive(p_archive_id UUID)
 RETURNS JSONB AS $$
 DECLARE
@@ -162,13 +173,17 @@ BEGIN
     SELECT * INTO v_archive_record
     FROM memory_archive
     WHERE id = p_archive_id;
-    
+
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Archive record with ID % not found', p_archive_id;
     END IF;
-    
+
+    -- Validate org access
+    IF NOT validate_org_access(v_archive_record.org_id) THEN
+        RAISE EXCEPTION 'Access denied: org_id mismatch';
+    END IF;
+
     -- Return the original data for restoration
-    -- Actual restoration logic depends on entity_type and is handled by application
     v_result := jsonb_build_object(
         'archive_id', p_archive_id,
         'entity_type', v_archive_record.entity_type,
@@ -177,7 +192,7 @@ BEGIN
         'archived_at', v_archive_record.archived_at,
         'restored_at', NOW()
     );
-    
+
     RETURN v_result;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -191,12 +206,17 @@ RETURNS INTEGER AS $$
 DECLARE
     v_deleted_count INTEGER;
 BEGIN
+    -- Validate org access
+    IF NOT validate_org_access(p_org_id) THEN
+        RAISE EXCEPTION 'Access denied: org_id mismatch';
+    END IF;
+
     DELETE FROM memory_archive
     WHERE org_id = p_org_id
       AND archived_at < NOW() - (p_older_than_days || ' days')::INTERVAL;
-    
+
     GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
-    
+
     RETURN v_deleted_count;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -212,7 +232,7 @@ WHERE archived_at > NOW() - INTERVAL '30 days';
 
 -- View for archive statistics by org
 CREATE OR REPLACE VIEW archive_stats_by_org AS
-SELECT 
+SELECT
     org_id,
     entity_type,
     COUNT(*) as archive_count,
@@ -227,7 +247,7 @@ GROUP BY org_id, entity_type;
 
 -- Grant access to backend_role
 GRANT ALL ON memory_archive TO backend_role;
-GRANT USAGE ON SEQUENCE memory_archive_id_seq TO backend_role;
+-- No sequence: memory_archive uses uuid_generate_v4()
 GRANT EXECUTE ON FUNCTION archive_memory_mapping TO backend_role;
 GRANT EXECUTE ON FUNCTION archive_entity TO backend_role;
 GRANT EXECUTE ON FUNCTION restore_from_archive TO backend_role;
@@ -241,7 +261,7 @@ GRANT SELECT ON archive_stats_by_org TO analytics_role;
 -- ============================================
 -- COMMENTS FOR DOCUMENTATION
 -- ============================================
-COMMENT ON TABLE memory_archive IS 'Backup/archive table for storing historical data';
+COMMENT ON TABLE memory_archive IS 'Backup/archive table for storing historical data (no RLS)';
 COMMENT ON COLUMN memory_archive.entity_id IS 'ID of the original entity that was archived';
 COMMENT ON COLUMN memory_archive.entity_type IS 'Type of entity: memory, ticket, mapping, user, custom';
 COMMENT ON COLUMN memory_archive.original_data IS 'Complete JSON snapshot of the archived entity';

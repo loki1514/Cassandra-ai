@@ -18,8 +18,9 @@ from typing import Optional, Dict, Any, Union
 from functools import lru_cache
 from datetime import datetime, timedelta
 
-import boto3
-from botocore.exceptions import ClientError, BotoCoreError
+# boto3 is lazy-loaded inside OrgKeyManager to avoid import failures
+# when AWS credentials are not configured. KMS operations will raise
+# KMSEncryptionError with a clear message when AWS is not available.
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -69,11 +70,33 @@ class OrgKeyManager:
             key_alias_prefix: Prefix for KMS key aliases
             enable_key_rotation: Whether to enable automatic key rotation
         """
-        self.kms_client = boto3.client('kms', region_name=aws_region)
+        self._aws_region = aws_region
         self.key_alias_prefix = key_alias_prefix
         self.enable_key_rotation = enable_key_rotation
         self._key_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ttl = timedelta(hours=1)
+        self._kms_client = None  # lazy-loaded
+
+    @property
+    def kms_client(self):
+        """Lazy-load KMS client. Returns None if AWS is not configured."""
+        if self._kms_client is None:
+            try:
+                import boto3
+                self._kms_client = boto3.client('kms', region_name=self._aws_region)
+            except Exception as e:
+                logger.warning("kms_client_unavailable", reason=str(e))
+                self._kms_client = None
+        return self._kms_client
+
+    def _require_kms(self):
+        """Raise KMSEncryptionError if KMS client is unavailable."""
+        if self.kms_client is None:
+            raise KMSEncryptionError(
+                "AWS KMS is not configured. "
+                "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (or AWS_ROLE_ARN), "
+                "and ensure boto3 is installed."
+            )
         
     def _get_key_alias(self, org_id: str) -> str:
         """Generate the KMS key alias for an organization."""
@@ -99,18 +122,21 @@ class OrgKeyManager:
     def generate_org_key(self, org_id: str) -> str:
         """
         Generate a new KMS key for an organization.
-        
+
         Args:
             org_id: Organization UUID
-            
+
         Returns:
             The KMS Key ID
-            
+
         Raises:
-            EncryptionError: If key generation fails
+            KMSEncryptionError: If AWS is not configured or key generation fails
         """
+        from botocore.exceptions import ClientError, BotoCoreError
+
+        self._require_kms()
         key_alias = self._get_key_alias(org_id)
-        
+
         try:
             # Check if key already exists
             try:
@@ -122,7 +148,12 @@ class OrgKeyManager:
             except ClientError as e:
                 if e.response['Error']['Code'] != 'NotFoundException':
                     raise
-            
+
+            # Get AWS account ID for key policy
+            import boto3
+            sts = boto3.client('sts')
+            account_id = sts.get_caller_identity()['Account']
+
             # Create new key
             key_policy = {
                 "Version": "2012-10-17",
@@ -131,7 +162,7 @@ class OrgKeyManager:
                         "Sid": "Enable IAM User Permissions",
                         "Effect": "Allow",
                         "Principal": {
-                            "AWS": f"arn:aws:iam::{boto3.client('sts').get_caller_identity()['Account']}:root"
+                            "AWS": f"arn:aws:iam::{account_id}:root"
                         },
                         "Action": "kms:*",
                         "Resource": "*"
@@ -151,13 +182,13 @@ class OrgKeyManager:
                         "Resource": "*",
                         "Condition": {
                             "StringEquals": {
-                                "kms:CallerAccount": boto3.client('sts').get_caller_identity()['Account']
+                                "kms:CallerAccount": account_id
                             }
                         }
                     }
                 ]
             }
-            
+
             response = self.kms_client.create_key(
                 Description=f"Cassandra AI encryption key for organization {org_id}",
                 KeyUsage='ENCRYPT_DECRYPT',
@@ -174,24 +205,24 @@ class OrgKeyManager:
                     }
                 ]
             )
-            
+
             key_id = response['KeyMetadata']['KeyId']
-            
+
             # Create alias for the key
             self.kms_client.create_alias(
                 AliasName=key_alias,
                 TargetKeyId=key_id
             )
-            
+
             # Enable automatic key rotation if configured
             if self.enable_key_rotation:
                 self.kms_client.enable_key_rotation(KeyId=key_id)
-            
+
             self._add_to_cache(org_id, key_id)
             logger.info(f"Created new KMS key for org {org_id}: {key_id}")
-            
+
             return key_id
-            
+
         except (ClientError, BotoCoreError) as e:
             logger.error(f"Failed to generate KMS key for org {org_id}: {e}")
             raise EncryptionError(f"Failed to generate KMS key: {e}")
@@ -199,23 +230,26 @@ class OrgKeyManager:
     def get_org_key(self, org_id: str) -> str:
         """
         Get the KMS key ID for an organization.
-        
+
         Args:
             org_id: Organization UUID
-            
+
         Returns:
             The KMS Key ID
-            
+
         Raises:
             KeyNotFoundError: If key doesn't exist
         """
+        from botocore.exceptions import ClientError
+
         # Check cache first
         cached_key = self._get_from_cache(org_id)
         if cached_key:
             return cached_key
-        
+
+        self._require_kms()
         key_alias = self._get_key_alias(org_id)
-        
+
         try:
             response = self.kms_client.describe_key(KeyId=key_alias)
             key_id = response['KeyMetadata']['KeyId']
@@ -257,7 +291,20 @@ class EncryptionService:
             key_alias_prefix=key_alias_prefix,
             enable_key_rotation=enable_key_rotation
         )
-        self.kms_client = boto3.client('kms', region_name=aws_region)
+        self._aws_region = aws_region
+        self._kms_client = None  # lazy-loaded
+
+    @property
+    def kms_client(self):
+        """Lazy-load KMS client. Returns None if AWS is not configured."""
+        if self._kms_client is None:
+            try:
+                import boto3
+                self._kms_client = boto3.client('kms', region_name=self._aws_region)
+            except Exception as e:
+                logger.warning("kms_client_unavailable", reason=str(e))
+                self._kms_client = None
+        return self._kms_client
         
     def _serialize_payload(self, payload: Any) -> bytes:
         """Serialize payload to bytes."""
@@ -274,7 +321,16 @@ class EncryptionService:
             return json.loads(data.decode('utf-8'))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return data.decode('utf-8')
-    
+
+    def _require_kms(self):
+        """Raise KMSEncryptionError if KMS client is unavailable."""
+        if self.kms_client is None:
+            raise KMSEncryptionError(
+                "AWS KMS is not configured. "
+                "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (or AWS_ROLE_ARN), "
+                "and ensure boto3 is installed."
+            )
+
     def encrypt(
         self,
         payload: Any,
@@ -303,6 +359,9 @@ class EncryptionService:
         Raises:
             EncryptionError: If encryption fails
         """
+        from botocore.exceptions import ClientError, BotoCoreError
+
+        self._require_kms()
         try:
             # Get or generate org key
             if key_id is None:
@@ -379,6 +438,9 @@ class EncryptionService:
         Raises:
             DecryptionError: If decryption fails
         """
+        from botocore.exceptions import ClientError, BotoCoreError
+
+        self._require_kms()
         try:
             # SECURITY FIX: Use stored key_id for decryption to support key rotation
             # The key_id should be stored alongside the encrypted data
@@ -386,7 +448,7 @@ class EncryptionService:
             
             # For now, use the alias which may point to old key during rotation
             # In production, retrieve the specific key_id from encrypted data metadata
-            key_alias = self._get_key_alias(org_id)
+            key_alias = self.key_manager._get_key_alias(org_id)
             
             # Decrypt the data key using KMS
             # Note: KMS can decrypt with any key version, not just the current alias target
@@ -433,18 +495,20 @@ class EncryptionService:
     def rotate_key(self, org_id: str) -> str:
         """
         Manually trigger key rotation for an organization.
-        
+
         Args:
             org_id: Organization UUID
-            
+
         Returns:
             New key ID
         """
+        from botocore.exceptions import ClientError, BotoCoreError
+
+        self._require_kms()
         key_id = self.key_manager.get_org_key(org_id)
-        
+
         try:
             self.kms_client.enable_key_rotation(KeyId=key_id)
-            response = self.kms_client.enable_key_rotation(KeyId=key_id)
             logger.info(f"Key rotation enabled for org {org_id}: {key_id}")
             return key_id
         except (ClientError, BotoCoreError) as e:
@@ -483,31 +547,55 @@ class KeyRotationManager:
             aws_region: AWS region
             key_alias_prefix: Prefix for key aliases
         """
-        self.kms_client = kms_client or boto3.client('kms', region_name=aws_region)
+        self._kms_client_provided = kms_client
+        self._aws_region = aws_region
         self.key_alias_prefix = key_alias_prefix
-        
+
         logger.info("key_rotation_manager_initialized")
-    
+
+    @property
+    def kms_client(self):
+        """Lazy-load KMS client. Returns None if AWS is not configured."""
+        if self._kms_client_provided is not None:
+            return self._kms_client_provided
+        try:
+            import boto3
+            return boto3.client('kms', region_name=self._aws_region)
+        except Exception as e:
+            logger.warning("kms_client_unavailable", reason=str(e))
+            return None
+
+    def _require_kms(self):
+        """Raise KMSEncryptionError if KMS client is unavailable."""
+        if self.kms_client is None:
+            raise KMSEncryptionError(
+                "AWS KMS is not configured. "
+                "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (or AWS_ROLE_ARN)."
+            )
+
     def _get_key_alias(self, org_id: str) -> str:
         """Generate key alias."""
         return f"{self.key_alias_prefix}-{org_id}"
-    
+
     async def get_key_metadata(self, org_id: str) -> Dict[str, Any]:
         """
         Get key metadata including rotation status.
-        
+
         Args:
             org_id: Organization ID
-            
+
         Returns:
             Key metadata dict
         """
+        from botocore.exceptions import ClientError
+
+        self._require_kms()
         key_alias = self._get_key_alias(org_id)
-        
+
         try:
             response = self.kms_client.describe_key(KeyId=key_alias)
             metadata = response['KeyMetadata']
-            
+
             # Get rotation status
             try:
                 rotation_response = self.kms_client.get_key_rotation_status(
@@ -516,7 +604,7 @@ class KeyRotationManager:
                 rotation_enabled = rotation_response['KeyRotationEnabled']
             except ClientError:
                 rotation_enabled = False
-            
+
             return {
                 "key_id": metadata['KeyId'],
                 "arn": metadata['Arn'],
@@ -526,7 +614,7 @@ class KeyRotationManager:
                 "rotation_enabled": rotation_enabled,
                 "rotation_period_days": self.ROTATION_PERIOD_DAYS
             }
-            
+
         except ClientError as e:
             logger.error(f"Failed to get key metadata for org {org_id}: {e}")
             raise KeyNotFoundError(f"Key not found for org {org_id}")
@@ -563,47 +651,53 @@ class KeyRotationManager:
     async def enable_auto_rotation(self, org_id: str) -> bool:
         """
         Enable automatic key rotation.
-        
+
         Args:
             org_id: Organization ID
-            
+
         Returns:
             True if enabled successfully
         """
+        from botocore.exceptions import ClientError
+
+        self._require_kms()
         key_alias = self._get_key_alias(org_id)
-        
+
         try:
             response = self.kms_client.describe_key(KeyId=key_alias)
             key_id = response['KeyMetadata']['KeyId']
-            
+
             self.kms_client.enable_key_rotation(KeyId=key_id)
-            
+
             logger.info(f"Auto rotation enabled for org {org_id}")
             return True
-            
+
         except ClientError as e:
             logger.error(f"Failed to enable rotation for org {org_id}: {e}")
             return False
-    
+
     async def manual_rotate(self, org_id: str) -> Dict[str, Any]:
         """
         Perform manual key rotation.
-        
+
         Creates a new key version and updates the alias.
-        
+
         Args:
             org_id: Organization ID
-            
+
         Returns:
             Rotation result
         """
+        from botocore.exceptions import ClientError
+
+        self._require_kms()
         old_key_alias = self._get_key_alias(org_id)
-        
+
         try:
             # Get old key info
             old_response = self.kms_client.describe_key(KeyId=old_key_alias)
             old_key_id = old_response['KeyMetadata']['KeyId']
-            
+
             # Create new key
             new_key_response = self.kms_client.create_key(
                 Description=f"Cassandra AI encryption key for organization {org_id} (rotated)",
@@ -615,33 +709,19 @@ class KeyRotationManager:
                     {'TagKey': 'Rotation', 'TagValue': 'manual'}
                 ]
             )
-            
+
             new_key_id = new_key_response['KeyMetadata']['KeyId']
-            
-            # SECURITY FIX: Store new key ID for decrypt operations
-            # DO NOT update alias yet - old ciphertexts need old key
-            # Store mapping in database for key version tracking
-            
-            # TODO: Re-encrypt all existing data with new key before rotating
-            # This is a placeholder - in production, run background job to:
-            # 1. Query all encrypted data for org
-            # 2. Decrypt with old key
-            # 3. Re-encrypt with new key
-            # 4. Update alias only after all data is re-encrypted
-            
+
             logger.warning(
                 "KEY ROTATION INCOMPLETE - Data re-encryption required",
                 extra={
                     "org_id": org_id,
-                    "old_key_id": old_key_id, 
+                    "old_key_id": old_key_id,
                     "new_key_id": new_key_id,
                     "action_required": "Run re-encryption job before completing rotation"
                 }
             )
-            
-            # Store key version info for later re-encryption
-            # DO NOT schedule old key deletion until re-encryption is complete
-            
+
             return {
                 "success": False,  # Mark as incomplete
                 "org_id": org_id,
@@ -652,7 +732,7 @@ class KeyRotationManager:
                 "warning": "Key rotation requires data re-encryption. Old key NOT scheduled for deletion.",
                 "action_required": "Run background re-encryption job before completing rotation"
             }
-            
+
         except ClientError as e:
             logger.error(f"Manual rotation failed for org {org_id}: {e}")
             raise EncryptionError(f"Manual rotation failed: {e}")
@@ -660,27 +740,30 @@ class KeyRotationManager:
     async def list_key_versions(self, org_id: str) -> list:
         """
         List all versions of an organization's key.
-        
+
         Args:
             org_id: Organization ID
-            
+
         Returns:
             List of key versions
         """
+        from botocore.exceptions import ClientError
+
+        self._require_kms()
         key_alias = self._get_key_alias(org_id)
-        
+
         try:
             response = self.kms_client.list_key_versions(KeyId=key_alias)
-            
+
             versions = []
             for version in response.get('Versions', []):
                 versions.append({
                     "key_id": version['KeyId'],
                     "creation_date": version['CreationDate'].isoformat()
                 })
-            
+
             return versions
-            
+
         except ClientError as e:
             logger.error(f"Failed to list key versions for org {org_id}: {e}")
             return []

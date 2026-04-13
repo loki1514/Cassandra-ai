@@ -25,7 +25,9 @@ from .context_fetcher import (
     FetchContextInput,
     FetchContextResult,
     resolve_query,
-    QueryResolutionError
+    QueryResolutionError,
+    fetch_full_context,
+    ContextResult,
 )
 from .idempotency import (
     generate_idempotency_key,

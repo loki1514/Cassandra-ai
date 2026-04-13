@@ -7,7 +7,11 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import re
+import asyncio
 from pydantic import BaseModel, Field
+
+from cassandra.rag.context_fetcher import fetch_full_context, ContextResult
+from cassandra.supabase import get_supabase_client
 
 
 class TicketExtraction(BaseModel):
@@ -59,8 +63,16 @@ class NaturalLanguageTicketProcessor:
         Returns:
             Created ticket details with confirmation
         """
-        # Step 1: Extract ticket information using LLM
-        extraction = await self._extract_ticket_info(audio_text, speaker_context)
+        # Step 0: Fetch dual-read context from Supabase + Supermemory
+        context = await fetch_full_context(
+            query=audio_text,
+            org_id=org_id,
+            data_hints=["tickets", "users", "assignments"],
+            top_k=5
+        )
+
+        # Step 1: Extract ticket information using LLM with combined context
+        extraction = await self._extract_ticket_info(audio_text, speaker_context, context)
         
         if extraction.confidence < 0.7:
             return {
@@ -97,30 +109,77 @@ class NaturalLanguageTicketProcessor:
             "extraction": extraction.dict()
         }
     
-    async def _extract_ticket_info(self, text: str, context: Dict[str, Any]) -> TicketExtraction:
-        """Use LLM to extract structured ticket info from natural language."""
-        
+    async def _extract_ticket_info(
+        self, text: str, speaker_context: Dict[str, Any], dual_context: ContextResult
+    ) -> TicketExtraction:
+        """Use LLM to extract structured ticket info from natural language, enriched with dual-read context."""
+
+        # Build context strings from both sources
+        supabase_context = ""
+        if dual_context.supabase_rows:
+            rows_str = "\n".join(
+                f"  - {row.get('_source_table', 'unknown')}: {row}"
+                for row in dual_context.supabase_rows[:5]
+            )
+            supabase_context = f"From Supabase:\n{rows_str}\n"
+        else:
+            supabase_context = "No Supabase data found.\n"
+
+        memory_context = ""
+        if dual_context.memory_chunks:
+            chunks_str = "\n".join(
+                f"  - [{chunk.get('source', 'unknown')}] {chunk.get('content', '')} (score={chunk.get('score', 0):.2f})"
+                for chunk in dual_context.memory_chunks[:5]
+            )
+            memory_context = f"From Supermemory:\n{chunks_str}\n"
+        else:
+            memory_context = "No Supermemory data found.\n"
+
         prompt = f"""
-        Extract ticket information from this voice command:
-        "{text}"
-        
-        Context:
-        - Speaker: {context.get('speaker_name', 'Unknown')}
-        - Current time: {datetime.now().isoformat()}
-        
-        Extract:
-        1. Task/action to be done (as ticket title)
-        2. Person being assigned (if mentioned)
-        3. Asset/location mentioned
-        4. Deadline (if mentioned - parse relative dates)
-        5. Priority (infer from urgency words)
-        
-        Return JSON with: title, assignee, asset, deadline, priority, confidence
-        """
-        
-        # LLM extraction would happen here
-        # For now, using rule-based extraction as fallback
-        return self._rule_based_extraction(text)
+Extract ticket information from this voice command:
+"{text}"
+
+Speaker: {speaker_context.get('speaker_name', 'Unknown')}
+Current time: {datetime.now().isoformat()}
+
+Relevant Context from Dual Read:
+{supabase_context}{memory_context}
+Extract:
+1. Task/action to be done (as ticket title)
+2. Person being assigned (if mentioned)
+3. Asset/location mentioned
+4. Deadline (if mentioned - parse relative dates)
+5. Priority (infer from urgency words)
+
+Return JSON with: title, assignee, asset, deadline, priority, confidence
+"""
+        try:
+            response = await self.llm.chat.completions.create(
+                model="claude-sonnet-4",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.2,
+            )
+            raw = response.choices[0].message.content
+            import json as _json
+            data = _json.loads(raw)
+            deadline = None
+            if data.get("deadline"):
+                try:
+                    deadline = datetime.fromisoformat(data["deadline"].replace("Z", "+00:00"))
+                except Exception:
+                    deadline = None
+            return TicketExtraction(
+                title=data.get("title", text)[:100],
+                assignee=data.get("assignee"),
+                asset=data.get("asset"),
+                deadline=deadline,
+                priority=data.get("priority", "medium"),
+                confidence=float(data.get("confidence", 0.85)),
+            )
+        except Exception:
+            # Fallback to rule-based extraction
+            return self._rule_based_extraction(text)
     
     def _rule_based_extraction(self, text: str) -> TicketExtraction:
         """Rule-based extraction as fallback."""
@@ -190,13 +249,45 @@ class NaturalLanguageTicketProcessor:
         return None
     
     async def _resolve_assignee(self, name: Optional[str], org_id: str) -> Optional[str]:
-        """Resolve assignee name to user ID."""
+        """Resolve assignee name to user ID via Supabase users table."""
         if not name:
             return None
-        
-        # Query user database by name
-        # This would integrate with the users table
-        return f"user_{name.lower()}"
+
+        client = get_supabase_client("service")
+        name_lower = name.lower().strip()
+
+        # Try exact match on display_name first, then fallback to partial match
+        result = (
+            client.table("users")
+            .select("id")
+            .eq("org_id", org_id)
+            .eq("is_active", True)
+            .execute()
+        )
+
+        matched = None
+        for row in result.data:
+            # Check display_name, full_name, or name fields
+            for field_key in ("display_name", "full_name", "name", "email"):
+                field_val = row.get(field_key, "")
+                if field_val and field_val.lower().strip() == name_lower:
+                    matched = row["id"]
+                    break
+            if matched:
+                break
+
+        # Fallback: ILIKE partial match on any name field
+        if not matched:
+            for row in result.data:
+                for field_key in ("display_name", "full_name", "name"):
+                    field_val = row.get(field_key, "")
+                    if field_val and name_lower in field_val.lower():
+                        matched = row["id"]
+                        break
+                if matched:
+                    break
+
+        return matched
     
     def _generate_confirmation(self, extraction: TicketExtraction, ticket: Dict) -> str:
         """Generate audio confirmation text."""

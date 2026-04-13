@@ -99,12 +99,16 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 -- ============================================
 
 -- View for active tickets only (excludes soft-deleted)
-CREATE OR REPLACE VIEW active_tickets AS
+-- Idempotent: drop first so CREATE OR REPLACE works on re-run
+DROP VIEW IF EXISTS active_tickets;
+CREATE VIEW active_tickets AS
 SELECT * FROM tickets 
 WHERE status NOT IN ('cancelled', 'archived');
 
 -- View for deleted tickets only
-CREATE OR REPLACE VIEW deleted_tickets AS
+-- Idempotent: drop first so CREATE OR REPLACE works on re-run
+DROP VIEW IF EXISTS deleted_tickets;
+CREATE VIEW deleted_tickets AS
 SELECT * FROM tickets 
 WHERE status IN ('cancelled', 'archived');
 

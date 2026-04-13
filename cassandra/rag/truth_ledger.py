@@ -29,7 +29,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 from dataclasses import dataclass, field, asdict
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -247,14 +247,12 @@ class TruthLedgerConfig(BaseModel):
     enable_verification: bool = Field(default=True)
     retention_days: int = Field(default=365, ge=30)
     
-    @root_validator
-    def validate_thresholds(cls, values):
+    @model_validator(mode='after')
+    def validate_thresholds(self):
         """Ensure threshold_low < threshold_high."""
-        low = values.get('review_queue_threshold_low')
-        high = values.get('review_queue_threshold_high')
-        if low >= high:
+        if self.review_queue_threshold_low >= self.review_queue_threshold_high:
             raise ValueError("review_queue_threshold_low must be less than review_queue_threshold_high")
-        return values
+        return self
     
     class Config:
         env_prefix = "TRUTH_LEDGER_"
@@ -272,7 +270,7 @@ class ReviewQueueEntry(BaseModel):
     status: ReviewStatus = ReviewStatus.PENDING
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "event_id": "evt_12345",
                 "entity_type": "decision",

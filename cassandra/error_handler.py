@@ -454,8 +454,11 @@ async def error_boundary(
         
         if reraise:
             raise
-        
-        return fallback_value
+
+        # Suppress the exception and exit the context normally.
+        # Note: the yielded value (if any) is returned to the `async with` caller.
+        # Async generators cannot return a value — use `return` without a value.
+        return
 
 
 def classify_error(error: Exception) -> ErrorInfo:
@@ -504,7 +507,8 @@ def classify_error(error: Exception) -> ErrorInfo:
 # FastAPI Error Handlers
 # =============================================================================
 
-from fastapi import FastAPI, Request, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 

@@ -21,6 +21,7 @@ from enum import Enum
 from typing import Optional, Dict, Any, List, AsyncGenerator, Callable
 from datetime import datetime
 
+import openai
 import httpx
 import structlog
 from pydantic import BaseModel, Field
@@ -209,6 +210,99 @@ class IntentDetector:
         return entities
 
 
+class OpenAITTS:
+    """
+    OpenAI text-to-speech integration.
+
+    Uses the OpenAI TTS API. Good quality, simple setup.
+    Voices: alloy, echo, fable, onyx, nova, shimmer
+    Models: tts-1 (fast), tts-1-hd (high quality)
+
+    Falls back gracefully if the API key is not set.
+    """
+
+    VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+
+    def __init__(self, api_key: Optional[str] = None, voice: str = "alloy", model: str = "tts-1"):
+        self.api_key = api_key or settings.openai.api_key
+        self.voice = voice if voice in self.VOICES else "alloy"
+        self.model = model
+        self._client: Optional[openai.AsyncOpenAI] = None
+        logger.info("openai_tts_initialized", voice=self.voice, model=self.model)
+
+    def _get_client(self) -> openai.AsyncOpenAI:
+        if self._client is None:
+            self._client = openai.AsyncOpenAI(api_key=self.api_key)
+        return self._client
+
+    async def generate_speech(
+        self,
+        text: str,
+        voice: str = "alloy",
+        model: str = "tts-1",
+        output_format: str = "mp3"
+    ) -> bytes:
+        """
+        Generate speech from text using OpenAI TTS.
+
+        Args:
+            text: Text to convert to speech
+            voice: Voice name (alloy, echo, fable, onyx, nova, shimmer)
+            model: Model (tts-1 or tts-1-hd)
+            output_format: Output format (mp3, opus, aac, flac)
+
+        Returns:
+            Audio bytes
+        """
+        if voice not in self.VOICES:
+            voice = "alloy"
+
+        try:
+            client = self._get_client()
+            response = await client.audio.speech.create(
+                model=model,
+                voice=voice,
+                input=text,
+                response_format=output_format
+            )
+            audio_bytes = await response.blob()
+            logger.debug(
+                "openai_tts_generated",
+                text_length=len(text),
+                voice=voice,
+                audio_size=len(audio_bytes)
+            )
+            return audio_bytes
+        except Exception as e:
+            logger.error("openai_tts_failed", error=str(e))
+            raise TTSGenerationError(f"OpenAI TTS failed: {e}")
+
+    async def stream_speech(
+        self,
+        text: str,
+        voice: str = "alloy",
+        model: str = "tts-1",
+        chunk_size: int = 8192
+    ) -> AsyncGenerator[bytes, None]:
+        """Stream speech generation from OpenAI."""
+        if voice not in self.VOICES:
+            voice = "alloy"
+
+        try:
+            client = self._get_client()
+            async with client.audio.speech.with_streaming_response.create(
+                model=model,
+                voice=voice,
+                input=text,
+                response_format="mp3"
+            ) as response:
+                async for chunk in response.iter_bytes(chunk_size):
+                    yield chunk
+        except Exception as e:
+            logger.error("openai_tts_stream_failed", error=str(e))
+            raise TTSGenerationError(f"OpenAI TTS stream failed: {e}")
+
+
 class ElevenLabsTTS:
     """
     ElevenLabs text-to-speech integration.
@@ -233,7 +327,13 @@ class ElevenLabsTTS:
         Args:
             api_key: ElevenLabs API key (defaults to env var)
         """
-        self.api_key = api_key or settings.openai.api_key  # Fallback
+        elevenlabs_key = (
+            api_key
+            or getattr(settings, 'elevenlabs_api_key', None)
+            or (settings.elevenlabs.api_key if hasattr(settings, 'elevenlabs') else None)
+            or ""
+        )
+        self.api_key = elevenlabs_key
         self._http_client: Optional[httpx.AsyncClient] = None
         
         logger.info("elevenlabs_tts_initialized")
@@ -359,31 +459,59 @@ class ElevenLabsTTS:
 class VoiceQueryHandler:
     """
     Main handler for voice queries.
-    
+
     Orchestrates:
     - Intent detection
     - Context retrieval
     - Response generation
-    - TTS conversion
+    - TTS conversion (ElevenLabs or OpenAI, whichever is configured)
     """
-    
+
     def __init__(
         self,
         memory_manager: Optional[MemoryManager] = None,
-        tts_client: Optional[ElevenLabsTTS] = None
+        tts_client: Optional[Any] = None
     ):
         """
         Initialize voice query handler.
-        
+
         Args:
             memory_manager: Memory manager for context retrieval
-            tts_client: TTS client for audio generation
+            tts_client: TTS client for audio generation (auto-selected if not provided)
         """
         self.intent_detector = IntentDetector()
         self.memory_manager = memory_manager
-        self.tts_client = tts_client or ElevenLabsTTS()
-        
-        logger.info("voice_query_handler_initialized")
+        self.tts_client = tts_client or self._select_tts_client()
+        logger.info(
+            "voice_query_handler_initialized",
+            tts_type=type(self.tts_client).__name__
+        )
+
+    def _select_tts_client(self) -> Any:
+        """
+        Select the best available TTS client.
+
+        Priority: ElevenLabs (if key set) > OpenAI (if key set) > ElevenLabs stub
+        """
+        # Check ElevenLabs first
+        elevenlabs_key = (
+            getattr(settings, 'elevenlabs_api_key', None)
+            or (settings.elevenlabs.api_key if hasattr(settings, 'elevenlabs') else None)
+            or ""
+        )
+
+        if elevenlabs_key:
+            logger.info("tts_provider_selected", provider="elevenlabs")
+            return ElevenLabsTTS(api_key=elevenlabs_key)
+
+        # Fall back to OpenAI TTS
+        if settings.openai.api_key:
+            logger.info("tts_provider_selected", provider="openai")
+            return OpenAITTS(voice="alloy", model="tts-1-hd")
+
+        # Neither configured — return ElevenLabs anyway (will fail gracefully)
+        logger.warning("tts_no_api_key_configured")
+        return ElevenLabsTTS()
     
     async def process_query(
         self,

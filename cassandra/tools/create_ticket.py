@@ -18,10 +18,14 @@ Security Features:
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional, List
 from enum import Enum
+
+# Compiled ANSI escape code pattern (used in validate_title)
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
 from pydantic import BaseModel, Field, validator, field_validator
 
@@ -39,10 +43,20 @@ class TicketPriority(str, Enum):
 
 
 class TicketStatus(str, Enum):
-    """Ticket status values."""
-    ACTIVE = "active"
-    PENDING = "pending"
-    ON_HOLD = "on_hold"
+    """
+    Ticket status values aligned with ticketing flow.
+
+    Status flow: open → waitlist → assigned → in_progress → pending_validation → resolved → closed
+    Special state: paused (can return to in_progress)
+    """
+    OPEN = "open"                          # Initial tenant submission (REQUESTED)
+    WAITLIST = "waitlist"                  # In department queue
+    ASSIGNED = "assigned"                  # MST self-assigned
+    IN_PROGRESS = "in_progress"            # MST actively working (WORK_STARTED)
+    PAUSED = "paused"                      # Explicitly paused with reason
+    PENDING_VALIDATION = "pending_validation"  # Awaiting tenant approval/validation
+    RESOLVED = "resolved"                  # Tenant-approved completion
+    CLOSED = "closed"                      # Admin-closed
 
 
 class CreateTicketInput(BaseModel):
@@ -76,6 +90,11 @@ class CreateTicketInput(BaseModel):
         default=TicketPriority.MEDIUM,
         description="Ticket priority level"
     )
+    category: Optional[str] = Field(
+        default=None,
+        max_length=100,
+        description="Ticket category (e.g., maintenance, repair, janitorial)"
+    )
     requester_email: Optional[str] = Field(
         default=None,
         max_length=255,
@@ -107,10 +126,12 @@ class CreateTicketInput(BaseModel):
     def validate_title(cls, v: str) -> str:
         """Sanitize and validate title."""
         v = v.strip()
+        # Remove null bytes
+        v = v.replace('\x00', '')
+        # Remove ANSI escape codes (terminal control characters)
+        v = ANSI_ESCAPE.sub('', v)
         if not v:
             raise ValueError("Title cannot be empty or whitespace only")
-        # Remove potentially dangerous characters
-        v = v.replace('\x00', '')  # Null bytes
         return v
     
     @field_validator('description')
@@ -167,13 +188,13 @@ class CreateTicketInput(BaseModel):
 class CreateTicketResult(BaseModel):
     """
     Result model for create_ticket tool.
-    
+
     Returns the created ticket details with all generated fields.
-    
+
     Attributes:
         ticket_id: Unique ticket identifier
         created_at: ISO timestamp of creation
-        status: Ticket status (always 'active' for new tickets)
+        status: Ticket status (always 'open' for new tickets)
         org_id: Organization ID (echoed from JWT)
         title: Ticket title (echoed)
         priority: Ticket priority (echoed)
@@ -346,40 +367,28 @@ class CreateTicketTool:
                 await conn.execute(
                     """
                     INSERT INTO tickets (
-                        ticket_id,
-                        ticket_number,
+                        id,
                         org_id,
                         title,
                         description,
-                        priority,
                         status,
-                        requester_email,
-                        assignee_id,
-                        tags,
-                        custom_fields,
-                        source,
-                        created_by,
+                        priority,
+                        category,
+                        assigned_to,
                         created_at,
-                        updated_at,
-                        idempotency_key
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                        updated_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     """,
                     ticket_id,
-                    ticket_number,
                     org_id,
                     input_data.title,
                     input_data.description,
+                    TicketStatus.OPEN.value,  # New tickets always start as 'open'
                     input_data.priority.value,
-                    TicketStatus.ACTIVE.value,
-                    input_data.requester_email,
+                    input_data.category,
                     input_data.assignee_id,
-                    input_data.tags,
-                    json.dumps(input_data.custom_fields) if input_data.custom_fields else None,
-                    input_data.source,
-                    user_id,
                     created_at,
-                    created_at,
-                    input_data.idempotency_key
+                    created_at
                 )
             
             # Log audit event
@@ -393,7 +402,7 @@ class CreateTicketTool:
             return CreateTicketResult(
                 ticket_id=ticket_id,
                 created_at=created_at.isoformat(),
-                status=TicketStatus.ACTIVE,
+                status=TicketStatus.OPEN,  # New tickets always start as 'open'
                 org_id=org_id,
                 title=input_data.title,
                 priority=input_data.priority,

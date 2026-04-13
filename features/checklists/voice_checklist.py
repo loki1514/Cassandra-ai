@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import re
 
+from cassandra.rag.context_fetcher import fetch_full_context, ContextResult
+
 
 @dataclass
 class ChecklistItemMatch:
@@ -41,6 +43,14 @@ class VoiceChecklistProcessor:
         Returns:
             Completion result with matched items and confirmation
         """
+        # Step 0: Fetch dual-read context from Supabase + Supermemory
+        context = await fetch_full_context(
+            query=audio_text,
+            org_id=org_id,
+            data_hints=["checklists", "checklist_items", "tickets"],
+            top_k=5
+        )
+
         # Step 1: Parse checklist reference and items
         parsed = self._parse_checklist_command(audio_text)
         
@@ -103,7 +113,8 @@ class VoiceChecklistProcessor:
             "completed_items": [m.checklist_item_name for m in completed_items],
             "partial_items": [m.checklist_item_name for m in partial_items],
             "confirmation_audio_text": confirmation,
-            "alert": alert
+            "alert": alert,
+            "memory_chunks": context.memory_chunks,
         }
     
     def _parse_checklist_command(self, text: str) -> Dict[str, Any]:

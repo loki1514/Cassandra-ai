@@ -1,10 +1,18 @@
 """
 F11: OPEX Estimation for New Properties
 Estimate annual OPEX using Perplexity for local market rates and historical data.
+Uses dual-read: Supabase (structured OPEX data) + Supermemory (verbal cost discussions).
 """
 
 from typing import Dict, Any, List
 from dataclasses import dataclass
+
+try:
+    from cassandra.rag.context_fetcher import fetch_full_context, ContextResult
+    _DUAL_READ = True
+except ImportError:
+    _DUAL_READ = False
+    ContextResult = None  # type: ignore
 
 
 @dataclass
@@ -43,10 +51,24 @@ class OPEXEstimator:
                            org_id: str) -> Dict[str, Any]:
         """
         Generate OPEX estimate for new property.
-        
+
         Returns:
             Line-item OPEX estimate with confidence bands
         """
+        # Step 0: Dual-read — fetch conversational context from Supermemory
+        verbal_context: List[str] = []
+        if _DUAL_READ:
+            try:
+                ctx: ContextResult = await fetch_full_context(
+                    query=f"OPEX cost budget spending {property_type} {city}",
+                    org_id=org_id,
+                    data_hints=["budgets", "tickets", "vendors"],
+                    top_k=5,
+                )
+                verbal_context = [c.get("content", "") for c in ctx.memory_chunks]
+            except Exception:
+                pass  # Supermemory failure is non-fatal
+
         # Step 1: Query Perplexity for market rates
         market_rates = await self._fetch_market_rates(property_type, city)
         
@@ -102,7 +124,8 @@ class OPEXEstimator:
                 for item in line_items
             ],
             "comparable_properties": comparables,
-            "sources_cited": list(set(source for item in line_items for source in item.sources))
+            "sources_cited": list(set(source for item in line_items for source in item.sources)),
+            "verbal_context": verbal_context,
         }
     
     async def _fetch_market_rates(self, property_type: str, city: str) -> Dict[str, Any]:

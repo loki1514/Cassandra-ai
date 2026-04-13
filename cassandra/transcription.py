@@ -75,6 +75,22 @@ class TranscriptionResult:
     utterances: int
 
 
+@dataclass
+class TranscriptionConfig:
+    """
+    Configuration for the transcription pipeline.
+
+    Used to configure audio format, speaker settings, and language options.
+    This is a minimal stub — full configuration is passed directly to
+    AssemblyAI via the AssemblyAIClient constructor.
+    """
+    sample_rate: int = 16000
+    language_code: str = "en"
+    speakers_expected: Optional[int] = None
+    enable_diarization: bool = True
+    confidence_threshold: float = 0.5
+
+
 # =============================================================================
 # Custom Exceptions
 # =============================================================================

@@ -19,10 +19,11 @@ Output Format:
 }
 """
 
+import asyncio
 import json
 import re
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from enum import Enum
 
@@ -75,7 +76,8 @@ class ExtractedCommitment:
     requires_review: bool = False
     
     def __post_init__(self):
-        """Set requires_review flag based on confidence."""
+        """Clamp confidence to [0.0, 1.0] and set requires_review flag."""
+        self.confidence = max(0.0, min(1.0, self.confidence))
         self.requires_review = self.confidence < 0.7
     
     def to_dict(self) -> Dict[str, Any]:
@@ -573,7 +575,3 @@ All extracted commitments:
                 commitment_count=len(commitments))
     
     return ticket_data
-
-
-# Import asyncio for batch processing
-import asyncio

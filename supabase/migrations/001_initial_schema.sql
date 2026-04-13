@@ -39,32 +39,49 @@ CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 -- ============================================
 -- TICKETS TABLE
 -- ============================================
+-- Statement 6: Create tickets table with ticketing flow statuses
+-- Status flow: open → waitlist → assigned → in_progress → pending_validation → resolved → closed
+-- Special states: paused (can return to in_progress)
 CREATE TABLE IF NOT EXISTS tickets (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     org_id UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     description TEXT,
     status TEXT NOT NULL DEFAULT 'open',
+    priority TEXT DEFAULT 'medium',
+    category TEXT,
     assigned_to UUID REFERENCES users(id) ON DELETE SET NULL,
+    paused_reason TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
-    
-    -- Status constraint (will be expanded in T03)
-    CONSTRAINT chk_ticket_status CHECK (status IN ('open', 'in_progress', 'active', 'completed', 'cancelled', 'archived'))
+    resolved_at TIMESTAMPTZ,
+    closed_at TIMESTAMPTZ,
+
+    -- Status constraint aligned with ticketing flow
+    -- open: Initial tenant submission (REQUESTED)
+    -- waitlist: In department queue
+    -- assigned: MST self-assigned
+    -- in_progress: MST actively working (WORK_STARTED)
+    -- paused: Explicitly paused with reason
+    -- pending_validation: Awaiting tenant approval/validation
+    -- resolved: Tenant-approved completion
+    -- closed: Admin-closed
+    CONSTRAINT chk_ticket_status CHECK (status IN ('open', 'waitlist', 'assigned', 'in_progress', 'paused', 'pending_validation', 'resolved', 'closed')),
+    CONSTRAINT chk_ticket_priority CHECK (priority IN ('low', 'medium', 'high', 'urgent'))
 );
 
--- Indexes for tickets table
+-- Statement 7: Create indexes for tickets table
 CREATE INDEX IF NOT EXISTS idx_tickets_org_id ON tickets(org_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_assigned_to ON tickets(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_tickets_created_at ON tickets(created_at);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
-
--- Composite index for org-scoped queries
 CREATE INDEX IF NOT EXISTS idx_tickets_org_status ON tickets(org_id, status);
+CREATE INDEX IF NOT EXISTS idx_tickets_priority ON tickets(priority);
 
 -- ============================================
 -- AUTO-UPDATE TRIGGER FOR updated_at
 -- ============================================
+-- Statement 8: Create function to auto-update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -73,13 +90,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Apply updated_at trigger to relevant tables
+-- Statement 9: Apply updated_at trigger to users table
 DROP TRIGGER IF EXISTS trigger_users_updated_at ON users;
 CREATE TRIGGER trigger_users_updated_at
     BEFORE UPDATE ON users
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+-- Statement 10: Apply updated_at trigger to tickets table
 DROP TRIGGER IF EXISTS trigger_tickets_updated_at ON tickets;
 CREATE TRIGGER trigger_tickets_updated_at
     BEFORE UPDATE ON tickets

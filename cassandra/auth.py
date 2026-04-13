@@ -442,7 +442,7 @@ async def get_current_user_optional(
 def require_org_access(org_id_param: str = "org_id"):
     """
     Dependency factory to require organization access.
-    
+
     Usage:
         @app.get("/orgs/{org_id}/data")
         async def get_org_data(
@@ -453,48 +453,38 @@ def require_org_access(org_id_param: str = "org_id"):
             pass
     """
     async def _check_org_access(
+        request: Request,
         user: UserContext = Depends(get_current_user)
     ) -> UserContext:
-        # SECURITY: Verify user has access to the requested org
-        # Query database to confirm user's org membership
-        from cassandra.config import settings
-        from supabase import create_client
-        
-        try:
-            supabase = create_client(
-                settings.SUPABASE_URL,
-                settings.SUPABASE_SERVICE_ROLE_KEY
+        # SECURITY: Extract the requested org_id from path params
+        requested_org = request.path_params.get(org_id_param)
+
+        if not requested_org:
+            logger.warning(
+                "org_id_missing_from_path",
+                user_id=user.user_id,
+                param_name=org_id_param
             )
-            
-            # Check if user belongs to the org in their token
-            result = supabase.table("users")\
-                .select("id")\
-                .eq("id", user.user_id)\
-                .eq("org_id", user.org_id)\
-                .execute()
-            
-            if not result.data:
-                logger.warning(
-                    "org_access_denied",
-                    user_id=user.user_id,
-                    requested_org=user.org_id
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="User does not have access to this organization"
-                )
-            
-            return user
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error("org_access_check_failed", error=str(e))
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to verify organization access"
-            ) from e
-    
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing '{org_id_param}' path parameter"
+            )
+
+        # SECURITY: User can only access their own organization
+        if user.org_id != requested_org:
+            logger.warning(
+                "org_access_denied",
+                user_id=user.user_id,
+                user_org=user.org_id,
+                requested_org=requested_org
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not have access to this organization"
+            )
+
+        return user
+
     return _check_org_access
 
 
@@ -616,11 +606,217 @@ def create_test_token(
 def decode_token_unsafe(token: str) -> Dict[str, Any]:
     """
     Decode token without verification (for debugging only).
-    
+
     Args:
         token: JWT token string
-        
+
     Returns:
         Token payload (unverified)
     """
     return jwt.decode(token, options={"verify_signature": False})
+
+
+# =============================================================================
+# FMS JWKS Verification + Cassandra Session Tokens
+# =============================================================================
+
+_jwks_cache: Dict = {}
+_jwks_cache_time: float = 0
+JWKS_CACHE_TTL = 300  # 5 minutes
+
+
+async def verify_fms_jwt(user_jwt: str) -> Optional[Dict[str, Any]]:
+    """
+    Verify an FMS Supabase JWT via JWKS public key endpoint.
+
+    Args:
+        user_jwt: Raw JWT string from the FMS Supabase auth session.
+
+    Returns:
+        Dict with user_id, org_id, role, verified=True on success.
+        None if the token is invalid, expired, or verification fails.
+    """
+    global _jwks_cache, _jwks_cache_time
+
+    if not user_jwt:
+        logger.warning("verify_fms_jwt called with empty token")
+        return None
+
+    # Fetch JWKS if cache is stale
+    now = time.time()
+    if not _jwks_cache or (now - _jwks_cache_time) > JWKS_CACHE_TTL:
+        jwks_url = f"{settings.auth.fms_supabase_url}/auth/v1/.well-known/jwks.json"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(jwks_url)
+                response.raise_for_status()
+                _jwks_cache = response.json()
+                _jwks_cache_time = now
+                logger.debug("jwks_cache_refreshed", url=jwks_url)
+        except httpx.HTTPError as exc:
+            logger.error("jwks_fetch_failed url=%s error=%s", jwks_url, str(exc))
+            # Return None — fail closed rather than open
+            return None
+
+    try:
+        # Extract kid from token header
+        header = jwt.get_unverified_header(user_jwt)
+        kid = header.get("kid")
+        if not kid:
+            logger.warning("fms_jwt_missing_kid")
+            return None
+
+        # Find matching JWK
+        signing_key = None
+        for key in _jwks_cache.get("keys", []):
+            if key.get("kid") == kid:
+                signing_key = _jwk_to_pem_for_auth(key)
+                break
+
+        if not signing_key:
+            logger.warning("fms_jwt_kid_not_in_jwks kid=%s", kid)
+            # Clear stale cache and retry once
+            _jwks_cache = {}
+            _jwks_cache_time = 0
+            return await verify_fms_jwt(user_jwt)
+
+        # Verify signature and decode
+        payload = jwt.decode(
+            user_jwt,
+            signing_key,
+            algorithms=["RS256"],
+        )
+
+        user_id = payload.get("sub")
+        if not user_id:
+            logger.warning("fms_jwt_missing_sub")
+            return None
+
+        # Extract org_id from user_metadata or app_metadata
+        org_id = None
+        role = "tenant"
+        user_meta = payload.get("user_metadata", {}) or {}
+        app_meta = payload.get("app_metadata", {}) or {}
+        org_id = user_meta.get("org_id") or app_meta.get("org_id")
+        role = app_meta.get("role") or user_meta.get("role") or "tenant"
+
+        logger.info(
+            "fms_jwt_verified",
+            user_id=user_id,
+            org_id=org_id,
+            role=role,
+        )
+
+        return {
+            "user_id": user_id,
+            "org_id": org_id,
+            "role": role,
+            "verified": True,
+        }
+
+    except jwt.ExpiredSignatureError:
+        logger.warning("fms_jwt_expired")
+        return None
+    except jwt.InvalidTokenError as exc:
+        logger.warning("fms_jwt_invalid error=%s", str(exc))
+        return None
+    except Exception as exc:
+        logger.error("fms_jwt_verification_error error=%s", str(exc))
+        return None
+
+
+def _jwk_to_pem_for_auth(jwk: Dict) -> str:
+    """Convert a JWK RSA public key dict to PEM string for jwt.decode()."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+    from cryptography.hazmat.backends import default_backend
+
+    e = int.from_bytes(_base64url_decode_for_auth(jwk["e"]), byteorder="big")
+    n = int.from_bytes(_base64url_decode_for_auth(jwk["n"]), byteorder="big")
+
+    public_numbers = RSAPublicNumbers(e, n)
+    public_key = public_numbers.public_key(default_backend())
+
+    pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return pem.decode("utf-8")
+
+
+def _base64url_decode_for_auth(input_str: str) -> bytes:
+    """Decode base64url string (from auth.py's JWTVerifier._base64url_decode)."""
+    import base64
+    padding = 4 - len(input_str) % 4
+    if padding != 4:
+        input_str += "=" * padding
+    return base64.urlsafe_b64decode(input_str)
+
+
+def issue_cassandra_token(
+    org_id: str,
+    user_id: Optional[str],
+    user_role: str,
+    verified: bool,
+) -> str:
+    """
+    Issue a short-lived Cassandra session token (HS256 signed).
+
+    Args:
+        org_id: Organization UUID.
+        user_id: User UUID (optional).
+        user_role: Role from verified JWT.
+        verified: True if JWT was verified via JWKS.
+
+    Returns:
+        JWT string signed with settings.auth.cassandra_token_secret.
+    """
+    now = time.time()
+    payload = {
+        "org_id": org_id,
+        "user_id": user_id,
+        "user_role": user_role,
+        "verified": verified,
+        "iat": int(now),
+        "exp": int(now + settings.auth.cassandra_token_expire_seconds),
+        "iss": "cassandra",
+    }
+
+    token = jwt.encode(
+        payload,
+        settings.auth.cassandra_token_secret,
+        algorithm="HS256",
+    )
+
+    logger.debug(
+        "cassandra_token_issued",
+        org_id=org_id,
+        user_id=user_id,
+        role=user_role,
+        verified=verified,
+        expires_in=settings.auth.cassandra_token_expire_seconds,
+    )
+
+    return token
+
+
+def decode_cassandra_token(token: str) -> Dict[str, Any]:
+    """
+    Decode and verify a Cassandra session token.
+
+    Args:
+        token: HS256-signed JWT string.
+
+    Returns:
+        Decoded payload dict.
+
+    Raises:
+        jwt.InvalidTokenError: If token is invalid or expired.
+    """
+    payload = jwt.decode(
+        token,
+        settings.auth.cassandra_token_secret,
+        algorithms=["HS256"],
+        options={"verify_iss": False},
+    )
+    return payload

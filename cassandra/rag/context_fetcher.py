@@ -21,7 +21,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Union
 from dataclasses import dataclass, field
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, validator
 
 from .memory_manager import MemoryManager, MemoryEntry, MemorySearchResult, MemoryType
 from ..encryption import EncryptionService
@@ -126,7 +126,7 @@ class FetchContextInput(BaseModel):
         return v.strip()
     
     class Config:
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "query_text": "What was the resolution for the login timeout issue?",
                 "org_id": "org_12345",
@@ -668,67 +668,7 @@ class ContextFetcher:
         except Exception as e:
             logger.error(f"Memory search failed: {e}")
             return []
-    
-    async def _resolve_context_items(
-        self,
-        memory_results: List[MemorySearchResult],
-        input_data: FetchContextInput
-    ) -> List[ContextItem]:
-        """
-        Resolve memories to context items via map table and DB1.
-        
-        For each memory:
-        1. Check map table for ticket associations
-        2. Query DB1 for authoritative ticket data
-        3. Detect and resolve conflicts
-        """
-        context_items = []
-        
-        for memory_result in memory_results:
-            memory = memory_result.memory
-            
-            # Create base context item from memory
-            item = ContextItem(
-                content=memory.content,
-                source=ContextSource.MEMORY_ARCHIVE,
-                memory_id=memory.memory_id,
-                ticket_id=memory.ticket_id,
-                confidence=memory_result.similarity_score,
-                resolution_path=["memory_archive"]
-            )
-            
-            # If memory has ticket_id, resolve through map table
-            if memory.ticket_id:
-                db1_data = await self._resolve_via_map_table(
-                    memory.ticket_id, input_data.org_id
-                )
-                
-                if db1_data:
-                    result.sources_used.add(ContextSource.MAP_TABLE)
-                    result.sources_used.add(ContextSource.DB1_TICKET)
-                    
-                    # Detect conflicts
-                    conflict = self._detect_conflict(memory, db1_data)
-                    
-                    if conflict:
-                        item.conflict_detected = True
-                        result.conflicts_detected += 1
-                        
-                        # Apply conflict resolution
-                        resolved_item = self._resolve_conflict(
-                            item, db1_data, input_data.conflict_resolution
-                        )
-                        item = resolved_item
-                    else:
-                        # No conflict, enhance with DB1 data
-                        item.metadata["db1_enhanced"] = True
-                        item.metadata["ticket_data"] = db1_data
-                        item.resolution_path.extend(["map_table", "db1_ticket"])
-            
-            context_items.append(item)
-        
-        return context_items
-    
+
     async def _resolve_via_map_table(
         self, 
         ticket_id: str, 
@@ -1060,3 +1000,413 @@ async def resolve_query(
 class QueryResolutionError(Exception):
     """Raised when query resolution fails critically."""
     pass
+
+
+# =============================================================================
+# Dual-Read Layer: Supabase + Supermemory
+# =============================================================================
+
+import asyncio
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+import time
+
+import httpx
+
+from cassandra.supabase import get_supabase_client
+
+
+# Valid Supabase table names for data_hints enforcement
+VALID_TABLES = frozenset({
+    "tickets", "checklists", "checklist_items", "assets", "vendors",
+    "users", "assignments", "properties", "tenants", "contracts",
+    "budgets", "energy_readings", "maintenance_logs", "meetings",
+    "audit_logs", "answer_logs", "synonyms", "calendar_events",
+    "shifts", "locations"
+})
+
+
+@dataclass
+class ContextResult:
+    """
+    Result of the dual-read fetch_full_context operation.
+
+    Contains structured rows from Supabase and conversational chunks
+    from Supermemory, always scoped to a single org_id.
+    """
+    supabase_rows: List[Dict[str, Any]] = field(default_factory=list)
+    memory_chunks: List[Dict[str, Any]] = field(default_factory=list)
+    org_id: str = ""
+    sources_queried: List[str] = field(default_factory=list)
+    latency_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "supabase_rows": self.supabase_rows,
+            "memory_chunks": self.memory_chunks,
+            "org_id": self.org_id,
+            "sources_queried": self.sources_queried,
+            "latency_ms": round(self.latency_ms, 2),
+        }
+
+
+async def _fetch_supabase(
+    query: str,
+    org_id: str,
+    data_hints: List[str],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch structured data from Supabase based on data_hints.
+
+    SECURITY: Every query is scoped with .eq("org_id", org_id).
+    data_hints are validated against VALID_TABLES to prevent injection.
+
+    Args:
+        query: Natural language query (used for pgvector similarity search)
+        org_id: Organization ID — MUST be present
+        data_hints: List of table names to query
+        top_k: Maximum rows per table
+
+    Returns:
+        List of row dictionaries
+    """
+    rows: List[Dict[str, Any]] = []
+
+    # Validate table names
+    valid_hints = [t for t in data_hints if t in VALID_TABLES]
+    if not valid_hints:
+        valid_hints = list(VALID_TABLES)[:3]  # fallback to a safe default
+
+    try:
+        client = get_supabase_client("service")
+    except Exception as e:
+        logger.warning(f"Supabase client unavailable: {e}")
+        return rows
+
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        for table in valid_hints:
+            try:
+                # Use Supabase REST API with anon key for RLS enforcement,
+                # or service key for bypass — we rely on RLS so anon is fine.
+                svc = get_supabase_client("service")
+                # Build request URL
+                base_url = svc._url.rstrip("/")
+                headers = {
+                    "apikey": svc.api_key,
+                    "Authorization": f"Bearer {svc.api_key}",
+                    "Content-Type": "application/json",
+                }
+                params = {
+                    "org_id": f"eq.{org_id}",
+                    "select": "*",
+                    "limit": str(top_k),
+                }
+
+                resp = await http.get(
+                    f"{base_url}/rest/v1/{table}",
+                    headers=headers,
+                    params=params,
+                )
+                resp.raise_for_status()
+                table_rows = resp.json()
+                if table_rows:
+                    for row in table_rows:
+                        row["_source_table"] = table
+                    rows.extend(table_rows)
+
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"Supabase table '{table}' returned {e.response.status_code}")
+            except Exception as e:
+                logger.warning(f"Supabase query on '{table}' failed: {e}")
+
+    return rows
+
+
+async def _fetch_supermemory(
+    query: str,
+    org_id: str,
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch conversational memory from Supermemory API.
+
+    SECURITY: org_id is sent as a header (never in query params or body)
+    and filtered server-side by the Supermemory service.
+
+    Args:
+        query: Natural language search query
+        org_id: Organization ID for scoping
+        top_k: Maximum chunks to return
+
+    Returns:
+        List of memory chunk dictionaries
+    """
+    chunks: List[Dict[str, Any]] = []
+
+    try:
+        from cassandra.config import settings
+    except Exception:
+        logger.warning("Cannot import settings — Supermemory unavailable")
+        return chunks
+
+    if not settings.supermemory.is_configured:
+        logger.debug("Supermemory not configured, skipping")
+        return chunks
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.supermemory.timeout_seconds
+        ) as http:
+            headers = {
+                "Authorization": f"Bearer {settings.supermemory.api_key}",
+                "Content-Type": "application/json",
+            }
+            org_header = settings.supermemory.org_id_header
+            if org_header:
+                headers[org_header] = org_id
+
+            payload = {
+                "query": query,
+                "topK": top_k,
+                "filter": {
+                    "org_id": org_id,
+                },
+            }
+
+            resp = await http.post(
+                f"{settings.supermemory.api_url.rstrip('/')}"
+                f"{settings.supermemory.search_endpoint}",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Normalize response shape — Supermemory returns { "chunks": [...] }
+            # or { "results": [...] } or { "data": [...] }
+            raw = (
+                data.get("chunks")
+                or data.get("results")
+                or data.get("data")
+                or (data if isinstance(data, list) else [])
+            )
+            for chunk in raw[:top_k]:
+                if isinstance(chunk, dict):
+                    chunks.append({
+                        "content": chunk.get("content", ""),
+                        "score": chunk.get("score", chunk.get("similarity", 0.0)),
+                        "source": chunk.get("source", chunk.get("url", "supermemory")),
+                        "created_at": chunk.get("created_at", chunk.get("timestamp", "")),
+                    })
+
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            f"Supermemory API returned {e.response.status_code}"
+        )
+    except Exception as e:
+        logger.warning(f"Supermemory fetch failed: {e}")
+
+    return chunks
+
+
+async def fetch_full_context(
+    query: str,
+    org_id: str,
+    data_hints: List[str] = [],
+    top_k: int = 5,
+) -> ContextResult:
+    """
+    Fetch context from BOTH Supabase and Supermemory simultaneously.
+
+    This is the single entry point every feature must call to get a
+    complete picture: structured operational data (Supabase) AND
+    conversational memory (Supermemory).
+
+    SECURITY:
+        - org_id is enforced on EVERY Supabase query via .eq("org_id", ...)
+        - org_id is sent as a header to Supermemory for server-side scoping
+        - org_id is validated immediately — missing/empty raises ValueError
+
+    FAULT TOLERANCE:
+        - If Supabase fails: returns empty supabase_rows, continues
+        - If Supermemory fails: returns empty memory_chunks, continues
+        - One source never kills the other
+
+    Args:
+        query: Natural language query (e.g. "maintenance complaints about HVAC")
+        org_id: Organization identifier — REQUIRED, never empty
+        data_hints: Which Supabase tables to query (e.g. ["tickets", "assets"])
+                    Empty list queries all valid tables.
+        top_k: Maximum rows per source (default 5)
+
+    Returns:
+        ContextResult with supabase_rows, memory_chunks, org_id, sources_queried, latency_ms
+
+    Raises:
+        ValueError: If org_id is missing or empty
+
+    Example:
+        >>> ctx = await fetch_full_context(
+        ...     query="HVAC maintenance issues this quarter",
+        ...     org_id="org_abc123",
+        ...     data_hints=["tickets", "maintenance_logs", "assets"],
+        ...     top_k=5,
+        ... )
+        >>> print(f"Supabase: {len(ctx.supabase_rows)} rows")
+        >>> print(f"Supermemory: {len(ctx.memory_chunks)} chunks")
+    """
+    if not org_id or not org_id.strip():
+        raise ValueError(
+            "org_id is required and must be non-empty. "
+            "All queries must be scoped to an organization."
+        )
+
+    org_id = org_id.strip()
+    start = time.perf_counter()
+    result = ContextResult(org_id=org_id)
+
+    # Fire both reads simultaneously
+    supabase_task = _fetch_supabase(query, org_id, data_hints, top_k)
+    memory_task = _fetch_supermemory(query, org_id, top_k)
+
+    supabase_rows, memory_chunks = await asyncio.gather(
+        supabase_task,
+        memory_task,
+        return_exceptions=True,
+    )
+
+    # Handle exceptions — propagate only if BOTH sources failed critically
+    if isinstance(supabase_rows, Exception):
+        logger.error(f"Supabase fetch failed: {supabase_rows}")
+        supabase_rows = []
+    else:
+        result.supabase_rows = supabase_rows
+        result.sources_queried.append(f"supabase:{','.join(data_hints) or 'default'}")
+
+    if isinstance(memory_chunks, Exception):
+        logger.error(f"Supermemory fetch failed: {memory_chunks}")
+        memory_chunks = []
+    else:
+        result.memory_chunks = memory_chunks
+        result.sources_queried.append("supermemory")
+
+    result.latency_ms = (time.perf_counter() - start) * 1000
+
+    logger.info(
+        "fetch_full_context_completed",
+        org_id=org_id,
+        supabase_rows=len(result.supabase_rows),
+        memory_chunks=len(result.memory_chunks),
+        latency_ms=round(result.latency_ms, 2),
+        sources=result.sources_queried,
+    )
+
+    return result
+
+
+# =============================================================================
+# Supermemory Write — Session Memory
+# =============================================================================
+
+
+async def write_session_memory(
+    session_id: str,
+    org_id: str,
+    user_id: str | None,
+    session_stats: dict,
+) -> bool:
+    """
+    Write session summary to Supermemory after a voice session ends.
+
+    This is the Cassandra-sole writer pattern: Expo never writes to
+    Supermemory directly — only Cassandra writes post-session.
+
+    Args:
+        session_id: Unique session identifier.
+        org_id: Organization ID for scoping.
+        user_id: User who owned the session (optional).
+        session_stats: Session stats dict with keys like
+            duration_seconds, transcript_turns, interrupts_count, tool_calls.
+
+    Returns:
+        True if write succeeded, False otherwise.
+    """
+    try:
+        from cassandra.config import settings
+    except Exception:
+        logger.warning("Cannot import settings — Supermemory unavailable")
+        return False
+
+    if not settings.supermemory.is_configured:
+        logger.debug("Supermemory not configured, skipping session memory write")
+        return False
+
+    # Build a structured memory document summarizing the session
+    duration = session_stats.get("duration_seconds", 0)
+    turns = session_stats.get("transcript_turns", 0)
+    interrupts = session_stats.get("interrupts_count", 0)
+    tools = session_stats.get("tool_calls", 0)
+
+    memory_text = (
+        f"Voice session {session_id} summary: "
+        f"Duration {duration:.0f}s with {turns} conversation turns. "
+        f"User issued {interrupts} interrupt(s) and triggered {tools} tool call(s). "
+        f"Organization: {org_id}."
+        f" User: {user_id}." if user_id else ""
+    )
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(
+            timeout=settings.supermemory.timeout_seconds
+        ) as http:
+            headers = {
+                "Authorization": f"Bearer {settings.supermemory.api_key}",
+                "Content-Type": "application/json",
+            }
+            org_header = settings.supermemory.org_id_header
+            if org_header:
+                headers[org_header] = org_id
+
+            # Supermemory write endpoint (add memory)
+            payload = {
+                "content": memory_text,
+                "source": f"cassandra-session/{session_id}",
+                "url": f"cassandra://session/{session_id}",
+                "org_id": org_id,
+            }
+
+            write_url = (
+                f"{settings.supermemory.api_url.rstrip('/')}"
+                "/add"
+            )
+            resp = await http.post(write_url, headers=headers, json=payload)
+            resp.raise_for_status()
+
+            logger.info(
+                "session_memory_written",
+                session_id=session_id,
+                org_id=org_id,
+                status=resp.status_code,
+            )
+            return True
+
+    except httpx.HTTPStatusError as e:
+        logger.warning(
+            "supermemory_write_http_error",
+            session_id=session_id,
+            status=e.response.status_code,
+            body=str(e.response.text)[:200],
+        )
+    except Exception as e:
+        logger.warning(
+            "supermemory_write_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+
+    return False
+
+

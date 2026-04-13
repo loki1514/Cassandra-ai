@@ -1,11 +1,6 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { createClient } from '@supabase/supabase-js';
-
-const supabase = createClient(
-  "https://hapwbiteqgusvjifxium.supabase.co",
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhhcHdiaXRlcWd1c3ZqaWZ4aXVtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI2NDg3MTAsImV4cCI6MjA4ODIyNDcxMH0.vCVGys1SObclYC-72SibzOcjx4o2ZdCjSBCWOSpWO0s"
-);
+import { fmsSupabase } from '../lib/supabase';
 
 export default function LoginPage() {
   const [email, setEmail] = useState('');
@@ -24,14 +19,14 @@ export default function LoginPage() {
 
     try {
       if (isSignUp) {
-        const { error } = await supabase.auth.signUp({
+        const { error } = await fmsSupabase.auth.signUp({
           email,
           password,
         });
         if (error) throw error;
         setMessage('Check your email for a confirmation link!');
       } else {
-        const { error } = await supabase.auth.signInWithPassword({
+        const { error } = await fmsSupabase.auth.signInWithPassword({
           email,
           password,
         });

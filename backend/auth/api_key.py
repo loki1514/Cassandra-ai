@@ -91,10 +91,7 @@ async def validate_api_key(
     supabase_service_key = supabase_service_key or settings.supabase_service_role_key
 
     if not supabase_url or not supabase_service_key:
-        logger.warning(
-            "api_key_validation_skipped",
-            reason="supabase_not_configured",
-        )
+        logger.warning("api_key_validation_skipped reason=supabase_not_configured")
         # In development, allow a special dev key
         if plain_key == "sk_cassandra_dev":
             return APIKeyInfo(
@@ -158,14 +155,14 @@ async def validate_api_key(
             )
 
     except httpx.TimeoutException:
-        logger.error("api_key_validation_timeout", key_hash_prefix=plain_key[:18])
+        logger.error("api_key_validation_timeout key_hash_prefix=%s", plain_key[:18])
         raise InvalidAPIKeyError("API key validation timed out")
 
     except httpx.HTTPError as exc:
         logger.error(
-            "api_key_validation_http_error",
-            error=str(exc),
-            key_hash_prefix=plain_key[:18],
+            "api_key_validation_http_error error=%s key_hash_prefix=%s",
+            str(exc),
+            plain_key[:18],
         )
         raise InvalidAPIKeyError(f"API key validation failed: {exc}")
 
@@ -230,5 +227,5 @@ async def create_api_key(
             return plain_key, key_id
 
     except httpx.HTTPError as exc:
-        logger.error("api_key_creation_failed", error=str(exc))
+        logger.error("api_key_creation_failed error=%s", str(exc))
         raise

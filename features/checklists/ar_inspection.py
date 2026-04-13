@@ -7,6 +7,8 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
 
+from cassandra.rag.context_fetcher import fetch_full_context, ContextResult
+
 
 class ChecklistStatus(str, Enum):
     """Checklist item status for AR overlay."""
@@ -130,6 +132,14 @@ class ARInspectionProcessor:
         Returns:
             Completion confirmation
         """
+        # Step 0: Fetch dual-read context for prior verbal defect reports
+        defect_context = await fetch_full_context(
+            query=f"defect report asset {asset_id}",
+            org_id=org_id,
+            data_hints=["assets", "checklists"],
+            top_k=3
+        )
+
         # Step 1: Store completion photo
         photo_url = await self.storage.upload_completion_photo(
             photo_evidence,
@@ -173,9 +183,9 @@ class ARInspectionProcessor:
             confidence=1.0
         )
         
-        # Step 4: Run defect detection on photo
-        defect_result = await self._detect_defects(photo_evidence, asset_id, org_id)
-        
+        # Step 4: Run defect detection on photo, enriched with prior defect context
+        defect_result = await self._detect_defects(photo_evidence, asset_id, org_id, defect_context)
+
         return {
             "success": True,
             "item_name": result['name'],
@@ -351,13 +361,112 @@ class ARInspectionProcessor:
         
         return actions
     
-    async def _detect_defects(self, image_data: bytes, asset_id: str, 
-                             org_id: str) -> Dict[str, Any]:
-        """Detect defects in inspection photo using vision AI."""
-        # This would integrate with Google Vision or similar
-        # For now, return placeholder
-        return {
-            "defect_found": False,
-            "ticket_created": False,
-            "ticket_id": None
-        }
+    async def _detect_defects(self, image_data: bytes, asset_id: str,
+                             org_id: str,
+                             dual_context: Optional[ContextResult] = None) -> Dict[str, Any]:
+        """Detect defects in inspection photo using vision AI + LLM analysis."""
+        try:
+            # Step 1: Run OCR on the photo to get text
+            ocr_text = ""
+            try:
+                ocr_result = await self.ocr.extract_text(image_data)
+                ocr_text = ocr_result.get('text', '')
+            except Exception:
+                ocr_text = ""
+
+            # Step 2: Build prior defect context from dual-read
+            prior_defects = ""
+            if dual_context and dual_context.memory_chunks:
+                prior_defects = "Prior defect mentions:\n" + "\n".join(
+                    f"  - {c.get('content', '')}" for c in dual_context.memory_chunks[:3]
+                )
+            elif dual_context and dual_context.supabase_rows:
+                prior_defects = "Prior Supabase data:\n" + "\n".join(
+                    f"  - {row}" for row in dual_context.supabase_rows[:3]
+                )
+            else:
+                prior_defects = "No prior defect history found."
+
+            # Step 3: LLM defect analysis
+            defect_indicators = [
+                "crack", "fracture", "corrosion", "rust", "leak", "damage",
+                "missing", "broken", "bent", "loose", "worn", "tear",
+                "discoloration", "stain", "deformation", "wear", "fault",
+            ]
+            indicator_str = ", ".join(defect_indicators)
+
+            prompt = f"""
+You are a defect detection analyst. Analyze the following OCR text extracted from an asset inspection photo.
+
+OCR Text from photo:
+{ocr_text if ocr_text else "(no readable text found in image)"}
+
+{prior_defects}
+
+Look for these defect indicators: {indicator_str}
+
+Also check for:
+1. Physical damage signs (cracks, bends, corrosion)
+2. Missing components or fixtures
+3. Unusual wear patterns
+4. Leakage or fluid stains
+5. Any text mentioning defects, damage, or repair needed
+
+Respond with JSON:
+{{
+  "defect_found": true/false,
+  "defect_type": "description of defect type or null",
+  "severity": "low/medium/high/critical or null",
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}}
+"""
+            response = await self.ocr.llm.chat.completions.create(
+                model="claude-sonnet-4",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.1,
+            )
+            raw = response.choices[0].message.content
+            import json as _json
+            data = _json.loads(raw)
+
+            defect_found = data.get("defect_found", False)
+            ticket_created = False
+            ticket_id = None
+
+            # Auto-create defect ticket if defect found with high confidence
+            if defect_found and data.get("confidence", 0) >= 0.75:
+                try:
+                    client = get_supabase_client("service")
+                    ticket_data = {
+                        "title": f"Defect: {data.get('defect_type', 'Unknown')} on asset {asset_id}",
+                        "description": f"Severity: {data.get('severity', 'Unknown')}\nReasoning: {data.get('reasoning', '')}\nOCR Text: {ocr_text}",
+                        "org_id": org_id,
+                        "priority": "high" if data.get("severity") in ("high", "critical") else "medium",
+                        "source": "ar_defect_detection",
+                        "asset_id": asset_id,
+                        "status": "open",
+                    }
+                    result = client.table("tickets").insert(ticket_data).execute()
+                    if result.data:
+                        ticket_id = result.data[0].get("id")
+                        ticket_created = bool(ticket_id)
+                except Exception:
+                    pass
+
+            return {
+                "defect_found": defect_found,
+                "defect_type": data.get("defect_type"),
+                "severity": data.get("severity"),
+                "confidence": data.get("confidence", 0),
+                "reasoning": data.get("reasoning", ""),
+                "ticket_created": ticket_created,
+                "ticket_id": ticket_id,
+            }
+        except Exception:
+            return {
+                "defect_found": False,
+                "ticket_created": False,
+                "ticket_id": None,
+            }

@@ -16,6 +16,7 @@ Features:
 
 import asyncio
 import hashlib
+from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Any
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,8 @@ import os
 import numpy as np
 from numpy.linalg import norm
 import structlog
+
+from cassandra.config import settings
 
 logger = structlog.get_logger("cassandra.speaker_id")
 
@@ -294,7 +297,6 @@ SIMILARITY_THRESHOLD = 0.85
 
 # Database-backed speaker storage
 # Uses Supabase for persistence across restarts and horizontal scaling
-from cassera.config import settings
 
 
 class SpeakerDatabase:
@@ -306,8 +308,8 @@ class SpeakerDatabase:
     """
     
     def __init__(self):
-        self.supabase_url = settings.SUPABASE_URL
-        self.supabase_key = settings.SUPABASE_SERVICE_ROLE_KEY
+        self.supabase_url = settings.supabase.url
+        self.supabase_key = settings.supabase.service_role_key
         self._client = None
     
     @property
@@ -336,7 +338,7 @@ class SpeakerDatabase:
             logger.error("failed_to_load_speakers", org_id=org_id, error=str(e))
             return {}
     
-    async def store_speaker(self, org_id: str, speaker_id: str, 
+    async def store_speaker(self, org_id: str, speaker_id: str,
                            embedding: np.ndarray) -> bool:
         """Store or update a speaker embedding."""
         try:
@@ -344,13 +346,38 @@ class SpeakerDatabase:
                 "org_id": org_id,
                 "speaker_id": speaker_id,
                 "embedding": embedding.tolist(),
-                "updated_at": datetime.now().isoformat()
+                "updated_at": datetime.utcnow().isoformat()
             }).execute()
             return True
         except Exception as e:
-            logger.error("failed_to_store_speaker", 
+            logger.error("failed_to_store_speaker",
                         org_id=org_id, speaker_id=speaker_id, error=str(e))
             return False
+
+    async def delete_speaker(self, org_id: str, speaker_id: str) -> bool:
+        """Delete a speaker embedding."""
+        try:
+            self.client.table("speaker_embeddings").delete()\
+                .eq("org_id", org_id)\
+                .eq("speaker_id", speaker_id)\
+                .execute()
+            return True
+        except Exception as e:
+            logger.error("failed_to_delete_speaker",
+                        org_id=org_id, speaker_id=speaker_id, error=str(e))
+            return False
+
+    async def clear_org_speakers(self, org_id: str) -> int:
+        """Delete all speaker embeddings for an organization. Returns count deleted."""
+        try:
+            result = self.client.table("speaker_embeddings").delete()\
+                .eq("org_id", org_id)\
+                .execute()
+            return len(result.data)
+        except Exception as e:
+            logger.error("failed_to_clear_org_speakers",
+                        org_id=org_id, error=str(e))
+            return 0
 
 
 # Global speaker database instance
@@ -464,52 +491,49 @@ async def register_speaker(
 ) -> bool:
     """
     Register a new speaker in the organization's database.
-    
+
     Args:
         speaker_id: Unique speaker identifier
         embedding: 512-dim speaker embedding
         org_id: Organization ID for scoping
-        
+
     Returns:
         True if registration successful
     """
-    if org_id not in _speaker_db:
-        _speaker_db[org_id] = {}
-    
-    # Store normalized embedding
     normalized = embedding / (norm(embedding) + 1e-8)
-    _speaker_db[org_id][speaker_id] = normalized.astype(np.float32)
-    
-    logger.info(
-        "speaker_registered",
-        speaker_id=speaker_id,
-        org_id=org_id,
-        total_speakers=len(_speaker_db[org_id])
+    success = await _speaker_db.store_speaker(
+        org_id, speaker_id, normalized.astype(np.float32)
     )
-    
-    return True
+
+    if success:
+        logger.info(
+            "speaker_registered",
+            speaker_id=speaker_id,
+            org_id=org_id
+        )
+
+    return success
 
 
 async def unregister_speaker(speaker_id: str, org_id: str) -> bool:
     """
     Remove a speaker from the organization's database.
-    
+
     Args:
         speaker_id: Speaker identifier to remove
         org_id: Organization ID for scoping
-        
+
     Returns:
         True if removal successful
     """
-    if org_id in _speaker_db and speaker_id in _speaker_db[org_id]:
-        del _speaker_db[org_id][speaker_id]
+    success = await _speaker_db.delete_speaker(org_id, speaker_id)
+    if success:
         logger.info(
             "speaker_unregistered",
             speaker_id=speaker_id,
             org_id=org_id
         )
-        return True
-    return False
+    return success
 
 
 # =============================================================================
@@ -595,16 +619,14 @@ def get_embedding_hash(embedding: np.ndarray) -> str:
     return hashlib.sha256(rounded.tobytes()).hexdigest()[:16]
 
 
-def get_org_speakers(org_id: str) -> List[str]:
+async def get_org_speakers(org_id: str) -> List[str]:
     """Get list of registered speaker IDs for organization."""
-    return list(_speaker_db.get(org_id, {}).keys())
+    speakers = await _speaker_db.get_speakers(org_id)
+    return list(speakers.keys())
 
 
-def clear_org_speakers(org_id: str) -> int:
+async def clear_org_speakers(org_id: str) -> int:
     """Clear all speakers for an organization. Returns count removed."""
-    if org_id in _speaker_db:
-        count = len(_speaker_db[org_id])
-        _speaker_db[org_id] = {}
-        logger.info("org_speakers_cleared", org_id=org_id, count=count)
-        return count
-    return 0
+    count = await _speaker_db.clear_org_speakers(org_id)
+    logger.info("org_speakers_cleared", org_id=org_id, count=count)
+    return count
