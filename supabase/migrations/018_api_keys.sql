@@ -1,5 +1,6 @@
 -- Migration 018: API Keys table
 -- Stores hashed API keys for Cassandra Voice Server authentication.
+-- Rebuilt: idempotent and safe to re-run.
 
 BEGIN;
 
@@ -30,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_org_id ON api_keys(org_id);
 ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 
 -- Only authenticated users can view keys in their org
-CREATE POLICY "org_view_own_keys" ON api_keys
+CREATE POLICY IF NOT EXISTS "org_view_own_keys" ON api_keys
     FOR SELECT USING (
         org_id IN (
             SELECT org_id FROM users WHERE id = auth.uid()
@@ -38,10 +39,10 @@ CREATE POLICY "org_view_own_keys" ON api_keys
     );
 
 -- Service role can insert/delete keys
-CREATE POLICY "service_insert_keys" ON api_keys
+CREATE POLICY IF NOT EXISTS "service_insert_keys" ON api_keys
     FOR INSERT WITH CHECK (auth.role() = 'service_role');
 
-CREATE POLICY "service_delete_keys" ON api_keys
+CREATE POLICY IF NOT EXISTS "service_delete_keys" ON api_keys
     FOR DELETE USING (auth.role() = 'service_role');
 
 -- RPC function to validate a key (used by backend/auth/api_key.py)
@@ -63,7 +64,8 @@ END;
 $$;
 
 -- Trigger to auto-update updated_at
-CREATE OR REPLACE TRIGGER api_keys_updated_at
+DROP TRIGGER IF EXISTS api_keys_updated_at ON api_keys;
+CREATE TRIGGER api_keys_updated_at
     BEFORE UPDATE ON api_keys
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
