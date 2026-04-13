@@ -31,7 +31,8 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_org_id ON api_keys(org_id);
 ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
 
 -- Only authenticated users can view keys in their org
-CREATE POLICY IF NOT EXISTS "org_view_own_keys" ON api_keys
+DROP POLICY IF EXISTS "org_view_own_keys" ON api_keys;
+CREATE POLICY "org_view_own_keys" ON api_keys
     FOR SELECT USING (
         org_id IN (
             SELECT org_id FROM users WHERE id = auth.uid()
@@ -39,10 +40,12 @@ CREATE POLICY IF NOT EXISTS "org_view_own_keys" ON api_keys
     );
 
 -- Service role can insert/delete keys
-CREATE POLICY IF NOT EXISTS "service_insert_keys" ON api_keys
+DROP POLICY IF EXISTS "service_insert_keys" ON api_keys;
+CREATE POLICY "service_insert_keys" ON api_keys
     FOR INSERT WITH CHECK (auth.role() = 'service_role');
 
-CREATE POLICY IF NOT EXISTS "service_delete_keys" ON api_keys
+DROP POLICY IF EXISTS "service_delete_keys" ON api_keys;
+CREATE POLICY "service_delete_keys" ON api_keys
     FOR DELETE USING (auth.role() = 'service_role');
 
 -- RPC function to validate a key (used by backend/auth/api_key.py)
