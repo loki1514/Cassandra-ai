@@ -77,8 +77,9 @@ from cassandra.rag.memory_manager import MemoryManager, MemoryEntry, MemoryPrior
 from cassandra.logging_config import LogContext, generate_trace_id
 from backend.core.session_manager import get_session_manager, SessionState
 from cassandra.supabase import get_supabase_client
-from cassandra.rooms import router as rooms_router
+from cassandra.rooms import router as rooms_router, properties_router
 from cassandra.voice_enrollment import router as voice_enroll_router
+from cassandra.memory import router as memory_router
 
 # Configure structured logging
 structlog.configure(
@@ -317,7 +318,9 @@ app.include_router(voice_router)
 from cassandra.features_router import features_router
 app.include_router(features_router)
 app.include_router(rooms_router)
+app.include_router(properties_router)
 app.include_router(voice_enroll_router)
+app.include_router(memory_router)
 
 
 # =============================================================================
