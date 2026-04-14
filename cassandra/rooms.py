@@ -19,7 +19,6 @@ import structlog
 
 from cassandra.auth import get_current_user, UserContext
 from cassandra.supabase import get_supabase_client
-from cassandra.voice_enrollment import VoiceEnrollmentManager
 
 logger = structlog.get_logger("cassandra.rooms")
 

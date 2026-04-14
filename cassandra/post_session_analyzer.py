@@ -32,6 +32,7 @@ from cassandra.supabase import get_supabase_client
 logger = structlog.get_logger("cassandra.post_session_analyzer")
 
 SIMILARITY_THRESHOLD = 0.70
+MIN_SEGMENT_MS = 50  # M-3 fix: lowered from 100ms to 50ms to avoid excluding short speakers
 
 
 def _normalize_embedding(embedding: np.ndarray) -> np.ndarray:
@@ -206,12 +207,22 @@ async def run_room_analysis(
         label_segments.setdefault(seg.speaker_label, []).append(seg)
 
     label_embedding: Dict[str, np.ndarray] = {}
+    bytes_per_sample = 2
+
     for label, segs in label_segments.items():
         embeddings = []
         for seg in segs:
             try:
                 clip = _slice_audio(full_audio, seg.start_ms, seg.end_ms)
-                if len(clip) < 3200:  # Skip very short clips (< 100ms at 16kHz)
+                # M-3 fix: lowered threshold to 50ms (was 100ms) to avoid excluding
+                # late-joining speakers whose only utterance is brief.
+                min_bytes = int(MIN_SEGMENT_MS / 1000 * 16000 * bytes_per_sample)
+                if len(clip) < min_bytes:
+                    logger.debug(
+                        "short_segment_skipped",
+                        label=label,
+                        seg_ms=round(seg.end_ms - seg.start_ms, 1),
+                    )
                     continue
                 emb = await extract_embedding(clip)
                 embeddings.append(emb)
@@ -222,6 +233,7 @@ async def run_room_analysis(
             avg_emb = np.mean(embeddings, axis=0)
             label_embedding[label] = _normalize_embedding(avg_emb)
         else:
+            # No valid embeddings for this label — speaker will be marked Unknown.
             label_embedding[label] = None
 
     # ── Step 4: Match against room participants ───────────────────────────────
@@ -253,6 +265,29 @@ async def run_room_analysis(
 
     logger.info("speaker_map_built", labels=list(speaker_map.keys()))
 
+    # Build Pyannote segment index keyed by label for overlap lookup
+    # CR-3 fix: Pyannote labels (SPEAKER_00/01/02) and AssemblyAI labels
+    # (A/B/C) are independent numbering systems. We match by time overlap
+    # instead of by label string.
+    pyannote_by_label: Dict[str, List[DiarizationSegment]] = label_segments
+
+    def _find_pyannote_label_for_segment(aai_start_ms: float, aai_end_ms: float) -> str | None:
+        """Find which Pyannote label's segments overlap most with the given AAI segment."""
+        best_label: str | None = None
+        best_overlap_ms = 0.0
+
+        for label, pseg_list in pyannote_by_label.items():
+            for pseg in pseg_list:
+                overlap_start = max(aai_start_ms, pseg.start_ms)
+                overlap_end = min(aai_end_ms, pseg.end_ms)
+                if overlap_start < overlap_end:
+                    overlap_ms = overlap_end - overlap_start
+                    if overlap_ms > best_overlap_ms:
+                        best_overlap_ms = overlap_ms
+                        best_label = label
+
+        return best_label
+
     # ── Step 5: AssemblyAI transcript for content ─────────────────────────────
     try:
         aai_segments = await transcribe(full_audio, org_id=org_id)
@@ -261,14 +296,17 @@ async def run_room_analysis(
         aai_segments = []
 
     # Build enriched transcript segments
+    # CR-3 fix: match AssemblyAI segments to Pyannote labels via time overlap,
+    # then look up the speaker_map to get the matched name.
     enriched_segments = []
     for seg in aai_segments:
-        # Map AssemblyAI speaker label (A, B, C...) to Pyannote label if possible.
-        # AssemblyAI doesn't guarantee the same label ordering as Pyannote,
-        # but for now we use the AssemblyAI label directly as a fallback
-        # and map via best-effort if diarization labels overlap.
-        # In practice, both systems label the dominant speaker as A/00.
-        mapped = speaker_map.get(seg.speaker_label, {"user_id": None, "name": seg.speaker_label, "confidence": 0.0})
+        pyannote_label = _find_pyannote_label_for_segment(seg.start_ms, seg.end_ms)
+        if pyannote_label and pyannote_label in speaker_map:
+            mapped = speaker_map[pyannote_label]
+        else:
+            # No Pyannote overlap — fall back to AssemblyAI label as unknown
+            mapped = {"user_id": None, "name": seg.speaker_label, "confidence": 0.0}
+
         enriched_segments.append({
             "speaker_label": seg.speaker_label,
             "speaker_name": mapped["name"],
@@ -287,16 +325,45 @@ async def run_room_analysis(
         full_transcript_text = "\n".join([
             f"[{s['speaker_name']}]: {s['text']}" for s in enriched_segments
         ])
+
+        # M-7 fix: build speaker_context from the speaker_map so the LLM gets
+        # named speaker context rather than label strings.
+        speaker_context = {
+            label: info["name"]
+            for label, info in speaker_map.items()
+            if info["user_id"] is not None
+        }
+
         try:
-            extracted = await extract_ticket_data(full_transcript_text, speaker_context=None)
-            if extracted.get("title"):
-                action_items.append({
-                    "title": extracted["title"],
-                    "description": extracted.get("description", ""),
-                    "assignee_id": None,
-                    "assignee_name": None,
-                    "speaker_user_id": None,
+            extracted = await extract_ticket_data(full_transcript_text, speaker_context=speaker_context)
+            # H-6 fix: iterate ALL extracted commitments, not just the first one.
+            # extract_ticket_data returns a list of all commitments in
+            # extracted["extracted_commitments"]. The top-level "title" field
+            # is derived from the highest-confidence commitment only.
+            commitments = extracted.get("extracted_commitments", [])
+            if not commitments and extracted.get("title"):
+                # Fallback: at least one commitment was found (top-level title)
+                commitments = [{
+                    "text": extracted["title"],
+                    "speaker_id": extracted.get("assignee"),
                     "confidence": extracted.get("confidence", 0.5),
+                }]
+
+            # Build a reverse map: speaker_name → speaker_user_id from speaker_map
+            name_to_user_id: Dict[str, str | None] = {}
+            for label, info in speaker_map.items():
+                if info["name"] != "Unknown Speaker":
+                    name_to_user_id[info["name"]] = info["user_id"]
+
+            for commitment in commitments:
+                speaker_name = commitment.get("speaker_id", "unknown")
+                action_items.append({
+                    "title": commitment.get("text", extracted.get("title", "")),
+                    "description": commitment.get("context", ""),
+                    "assignee_id": name_to_user_id.get(speaker_name),
+                    "assignee_name": speaker_name if speaker_name != "unknown" else None,
+                    "speaker_user_id": name_to_user_id.get(speaker_name),
+                    "confidence": commitment.get("confidence", 0.5),
                     "priority": extracted.get("priority", "medium"),
                     "deadline": extracted.get("deadline"),
                     "source_text": full_transcript_text[:500],

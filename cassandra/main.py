@@ -31,6 +31,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import structlog
 
+# M-1 fix: set of pending background analysis tasks.
+# Tasks are added here when triggered and removed on completion so Python's
+# garbage collector does not cancel them prematurely.
+_pending_analysis_tasks: set[asyncio.Task] = set()
+
 from cassandra.config import settings, get_settings
 from cassandra.auth import (
     verify_jwt, get_current_user, UserContext,
@@ -893,9 +898,43 @@ async def websocket_audio_authenticated(
         # Trigger room-scoped post-session analysis if room was bound
         if room_context and room_db_id:
             full_audio = b"".join(session_recording)
-            try:
+
+            # M-4 fix: guard against empty or near-empty recordings.
+            # Less than 1 second of audio (16,000 bytes at 16kHz PCM16) is
+            # insufficient for meaningful diarization or transcription.
+            if len(full_audio) < 16000:
+                logger.warning(
+                    "session_audio_too_short_skipping_analysis",
+                    session_id=sess_id,
+                    bytes=len(full_audio),
+                )
+                try:
+                    from cassandra.post_session_analyzer import _update_room_analysis_status
+                    await _update_room_analysis_status(room_db_id, sess_org_id, "failed")
+                except Exception:
+                    pass
+            else:
+                # H-3 fix: append this session to the room's session list and
+                # link it as the active session before triggering analysis.
+                try:
+                    supabase = get_supabase_client("service")
+                    existing = supabase.table("rooms").select("session_ids").eq("id", room_db_id).eq("org_id", sess_org_id).execute()
+                    if existing.data:
+                        session_ids = existing.data[0].get("session_ids", [])
+                    else:
+                        session_ids = []
+                    session_ids.append(sess_id)
+                    supabase.table("rooms").update({
+                        "active_session_id": sess_id,
+                        "session_ids": session_ids,
+                    }).eq("id", room_db_id).eq("org_id", sess_org_id).execute()
+                except Exception as e:
+                    logger.error("room_session_linkage_failed", room_db_id=room_db_id, error=str(e))
+
+                # M-1 fix: store task reference so it is not garbage-collected.
+                # add_done_callback removes it from the set when complete.
                 from cassandra.post_session_analyzer import run_room_analysis
-                asyncio.create_task(
+                task = asyncio.create_task(
                     run_room_analysis(
                         room_db_id=room_db_id,
                         session_id=sess_id,
@@ -903,17 +942,13 @@ async def websocket_audio_authenticated(
                         full_audio=full_audio,
                     )
                 )
+                _pending_analysis_tasks.add(task)
+                task.add_done_callback(_pending_analysis_tasks.discard)
                 logger.info(
                     "room_analysis_triggered",
                     session_id=sess_id,
                     room_id=room_context.get("room_id"),
                     audio_bytes=len(full_audio),
-                )
-            except Exception as e:
-                logger.error(
-                    "room_analysis_trigger_failed",
-                    session_id=sess_id,
-                    error=str(e),
                 )
 
         if not settings.supermemory.is_configured:
@@ -1036,7 +1071,10 @@ async def websocket_audio_authenticated(
             return
 
     # ── Register connection and enter session ─────────────────────────────────
-    await websocket.accept()
+    # CR-1/CR-7 fix: only accept if not already accepted (cassandra_token path
+    # already called accept() at line 955; legacy token path needs it here)
+    if token:
+        await websocket.accept()
     client_id = f"ws_auth_{id(websocket)}_{int(time.time())}"
     manager.active_connections[client_id] = websocket
     buffer_manager = manager.get_buffer_manager(client_id)
@@ -1051,21 +1089,9 @@ async def websocket_audio_authenticated(
         "message": "Authenticated. Send PCM16 audio data.",
     })
 
-    # ── Greeting TTS (agent speaks first) ─────────────────────────────────────
-    greeting = "Hello, I'm Cassandra. How can I help you today?"
-    try:
-        tts = ElevenLabsTTS()
-        greeting_audio = await tts.generate_speech(greeting)
-        await websocket.send_bytes(greeting_audio)
-        logger.debug("greeting_tts_sent", session_id=session_id, audio_size=len(greeting_audio))
-    except Exception as tts_error:
-        logger.warning("greeting_tts_failed", error=str(tts_error))
-        await websocket.send_text(json.dumps({
-            "type": "voice_response",
-            "text": greeting
-        }))
-
     # Enter session context — end_session() + callbacks fire on exit
+    # M-2 fix: greeting fires AFTER session context is established so that
+    # _on_session_end callbacks are registered before any I/O that could fail.
     async with session_manager.create_session(
         session_id=session_id,
         org_id=org_id,
@@ -1073,6 +1099,41 @@ async def websocket_audio_authenticated(
         protocol_version="v2",
     ) as session_ctx:
         session_ctx.add_end_callback(_on_session_end)
+
+        # ── Activate room ─────────────────────────────────────────────────────
+        # H-3/H-4/H-5 fix: transition room to 'active', link session, validate status
+        if room_context and room_db_id:
+            supabase = get_supabase_client("service")
+            room_status = room_context.get("status", "waiting")
+            if room_status not in ("waiting", "active"):
+                logger.warning("room_not_available", room_id=room_id, status=room_status)
+                # Room is ended — don't bind but don't crash, just proceed without room features
+                room_context = None
+                room_db_id = None
+            else:
+                try:
+                    supabase.table("rooms").update({
+                        "status": "active",
+                        "active_session_id": session_id,
+                    }).eq("id", room_db_id).eq("org_id", org_id).execute()
+                    logger.debug("room_activated", room_id=room_id, session_id=session_id)
+                except Exception as e:
+                    logger.error("room_activation_failed", room_id=room_id, error=str(e))
+
+        # ── Greeting TTS (agent speaks first) ──────────────────────────────────
+        # Fires inside session context so failure cannot orphan the session.
+        greeting = "Hello, I'm Cassandra. How can I help you today?"
+        try:
+            tts = ElevenLabsTTS()
+            greeting_audio = await tts.generate_speech(greeting)
+            await websocket.send_bytes(greeting_audio)
+            logger.debug("greeting_tts_sent", session_id=session_id, audio_size=len(greeting_audio))
+        except Exception as tts_error:
+            logger.warning("greeting_tts_failed", error=str(tts_error))
+            await websocket.send_text(json.dumps({
+                "type": "voice_response",
+                "text": greeting
+            }))
 
         # Attach room metadata to session context for downstream use
         if room_context:

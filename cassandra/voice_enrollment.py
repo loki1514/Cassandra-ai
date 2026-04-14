@@ -13,6 +13,7 @@ Features:
 - Profile management via Supabase REST
 """
 
+import base64
 import hashlib
 import uuid
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ from typing import Optional, Dict, Any, List
 import numpy as np
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from cassandra.auth import get_current_user, UserContext
 from cassandra.supabase import get_supabase_client
@@ -42,8 +43,34 @@ class EnrollmentStatus(str, Enum):
 
 
 class VoiceEnrollmentRequest(BaseModel):
-    """Request body for voice enrollment."""
-    audio_samples: List[bytes] = Field(..., min_items=1, max_items=10, description="3-5 audio samples, 5-10s each")
+    """Request body for voice enrollment.
+
+    CR-2 fix: audio_samples must be base64-encoded strings, not raw bytes.
+    JSON has no native binary type; Pydantic cannot deserialize bytes from a JSON body.
+    Clients should base64-encode their WAV audio samples before POSTing.
+    """
+    audio_samples: List[str] = Field(
+        ...,
+        min_length=1,
+        max_items=10,
+        description="3-5 audio samples as base64-encoded WAV strings"
+    )
+
+    @field_validator("audio_samples", mode="before")
+    @classmethod
+    def decode_samples(cls, v):
+        """Validate that all items are valid base64 and decode to bytes."""
+        if not isinstance(v, (list, tuple)):
+            raise ValueError("audio_samples must be a list of base64 strings")
+        decoded = []
+        for i, item in enumerate(v):
+            if not isinstance(item, str):
+                raise ValueError(f"audio_samples[{i}] must be a base64 string, got {type(item).__name__}")
+            try:
+                decoded.append(base64.b64decode(item))
+            except Exception:
+                raise ValueError(f"audio_samples[{i}] is not valid base64")
+        return decoded
 
 
 class VoiceEnrollmentResponse(BaseModel):
@@ -140,21 +167,27 @@ async def _save_profile_to_supabase(
     """Upsert voice profile into Supabase voice_profiles table."""
     client = get_supabase_client("service")
     try:
-        result = client.table("voice_profiles").upsert({
-            "profile_id": profile_id,
-            "user_id": user_id,
-            "org_id": org_id,
-            "embedding": embedding,
-            "status": status,
-            "sample_count": sample_count,
-            "quality_score": quality_score,
-            "enrolled_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-            "metadata": {
+        # H-2 fix: use on_conflict="profile_id" so re-enrollment updates the
+        # existing row instead of creating a duplicate that violates
+        # the UNIQUE(org_id, user_id) constraint.
+        result = client.table("voice_profiles").upsert(
+            {
+                "profile_id": profile_id,
+                "user_id": user_id,
+                "org_id": org_id,
+                "embedding": embedding,
+                "status": status,
                 "sample_count": sample_count,
-                "avg_quality": quality_score
-            }
-        }).execute()
+                "quality_score": quality_score,
+                "enrolled_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "metadata": {
+                    "sample_count": sample_count,
+                    "avg_quality": quality_score
+                }
+            },
+            on_conflict="profile_id"
+        ).execute()
         return bool(result.data)
     except Exception as e:
         logger.error("save_profile_failed", error=str(e))
