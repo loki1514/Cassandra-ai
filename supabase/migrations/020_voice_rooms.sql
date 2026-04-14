@@ -3,10 +3,10 @@
 -- with org-scoped voice enrollment and post-session speaker identification.
 --
 -- Fixes applied:
---   CR-4: ivfflat index uses WITH (lists = 100) — required by pgvector >= 0.5
---   H-1:  RLS policies added for all 4 tables
+--   CR-4: Switched ivfflat to hnsw (pgvector >= 0.5 requires lists param)
+--   H-1:  RLS policies added for all 4 tables (using users table, not user_orgs)
 --   M-5:  composite index on (room_id, start_ms) for enriched_transcripts
---   M-6:  index on rooms.active_session_id for fast lookups
+--   M-6:  partial index on rooms.active_session_id for fast lookups
 
 -- ============================================
 -- 1. VOICE PROFILES (org-scoped enrollment)
@@ -154,26 +154,27 @@ ALTER TABLE action_items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "service_role_all_voice_profiles" ON voice_profiles
     FOR ALL USING (auth.role() = 'service_role');
 
--- Users can only see/modify their own profile within their org
+-- Users can only see/modify their own profile within their org.
+-- users.org_id is a direct FK to orgs — no junction table exists.
 CREATE POLICY "users_own_voice_profile_select" ON voice_profiles
     FOR SELECT USING (
         user_id = auth.uid()
-        AND org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        AND org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 CREATE POLICY "users_own_voice_profile_insert" ON voice_profiles
     FOR INSERT WITH CHECK (
         user_id = auth.uid()
-        AND org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        AND org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 CREATE POLICY "users_own_voice_profile_update" ON voice_profiles
     FOR UPDATE USING (
         user_id = auth.uid()
-        AND org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        AND org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 CREATE POLICY "users_own_voice_profile_delete" ON voice_profiles
     FOR DELETE USING (
         user_id = auth.uid()
-        AND org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        AND org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 
 -- ── rooms ───────────────────────────────────────────────────────────────────
@@ -183,15 +184,15 @@ CREATE POLICY "service_role_all_rooms" ON rooms
 -- Org-scoped read/write access
 CREATE POLICY "org_rooms_select" ON rooms
     FOR SELECT USING (
-        org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 CREATE POLICY "org_rooms_insert" ON rooms
     FOR INSERT WITH CHECK (
-        org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 CREATE POLICY "org_rooms_update" ON rooms
     FOR UPDATE USING (
-        org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 
 -- ── enriched_transcripts ────────────────────────────────────────────────────
@@ -199,7 +200,7 @@ CREATE POLICY "service_role_all_enriched_transcripts" ON enriched_transcripts
     FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "org_enriched_transcripts_select" ON enriched_transcripts
     FOR SELECT USING (
-        org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 
 -- ── action_items ────────────────────────────────────────────────────────────
@@ -207,13 +208,13 @@ CREATE POLICY "service_role_all_action_items" ON action_items
     FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "org_action_items_select" ON action_items
     FOR SELECT USING (
-        org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 CREATE POLICY "org_action_items_insert" ON action_items
     FOR INSERT WITH CHECK (
-        org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
 CREATE POLICY "org_action_items_update" ON action_items
     FOR UPDATE USING (
-        org_id IN (SELECT org_id FROM user_orgs WHERE user_id = auth.uid())
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );
