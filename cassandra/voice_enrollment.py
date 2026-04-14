@@ -1,20 +1,19 @@
 """
-T42: Voice Enrollment
+T42: Voice Enrollment (DB-backed, Supabase-powered)
 
 This module provides voice enrollment functionality:
 - Speaker enrollment flow
-- Voice embedding storage
+- Voice embedding storage in voice_profiles (VECTOR(512))
 - Speaker verification
 - Voice profile management
 
 Features:
 - Multi-sample enrollment
-- Embedding extraction
-- Profile management
+- Embedding extraction via Pyannote (async, background-only)
+- Profile management via Supabase REST
 """
 
 import hashlib
-import io
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,9 +22,15 @@ from typing import Optional, Dict, Any, List
 
 import numpy as np
 import structlog
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
+from cassandra.auth import get_current_user, UserContext
+from cassandra.supabase import get_supabase_client
+
 logger = structlog.get_logger("cassandra.voice_enrollment")
+
+router = APIRouter(prefix="/api/v1/voice-enroll", tags=["Voice Enrollment"])
 
 
 class EnrollmentStatus(str, Enum):
@@ -36,516 +41,232 @@ class EnrollmentStatus(str, Enum):
     FAILED = "failed"
 
 
-@dataclass
-class VoiceSample:
-    """Voice sample for enrollment."""
-    sample_id: str
-    audio_data: bytes
-    duration_ms: int
-    quality_score: float
-    created_at: datetime
+class VoiceEnrollmentRequest(BaseModel):
+    """Request body for voice enrollment."""
+    audio_samples: List[bytes] = Field(..., min_items=1, max_items=10, description="3-5 audio samples, 5-10s each")
 
 
-@dataclass
-class VoiceProfile:
-    """Speaker voice profile."""
-    profile_id: str
-    user_id: str
-    org_id: str
-    embedding: List[float]
-    samples: List[VoiceSample]
-    status: EnrollmentStatus
-    created_at: datetime
-    updated_at: datetime
-    metadata: Dict[str, Any]
-
-
-class VoiceEnrollmentInput(BaseModel):
-    """Input for voice enrollment."""
-    
-    user_id: str = Field(..., description="User ID to enroll")
-    org_id: str = Field(..., description="Organization ID")
-    audio_samples: List[bytes] = Field(..., description="Audio samples for enrollment")
-    min_samples: int = Field(default=3, description="Minimum samples required")
-    max_samples: int = Field(default=5, description="Maximum samples allowed")
-    
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "user_id": "user_abc123",
-                "org_id": "org_12345",
-                "min_samples": 3,
-                "max_samples": 5
-            }
-        }
-
-
-class VoiceEnrollmentResult(BaseModel):
-    """Result of voice enrollment."""
-    
+class VoiceEnrollmentResponse(BaseModel):
+    """Response for voice enrollment."""
     success: bool
     profile_id: Optional[str] = None
     user_id: Optional[str] = None
     samples_processed: int = 0
     quality_score: float = 0.0
-    status: EnrollmentStatus = EnrollmentStatus.PENDING
+    status: str = "pending"
     errors: List[str] = []
 
 
-class VoiceEnrollmentManager:
-    """
-    Manages voice enrollment and speaker profiles.
-    
-    Usage:
-        manager = VoiceEnrollmentManager(db_pool)
-        
-        # Enroll user
-        result = await manager.enroll(
-            user_id="user_123",
-            org_id="org_456",
-            audio_samples=[sample1, sample2, sample3]
-        )
-        
-        # Verify speaker
-        match = await manager.verify(
-            profile_id="profile_789",
-            audio_sample=test_sample
-        )
-    """
-    
-    def __init__(self, db_pool: Any):
-        """
-        Initialize enrollment manager.
-        
-        Args:
-            db_pool: Database connection pool
-        """
-        self.db_pool = db_pool
-        
-        logger.info("voice_enrollment_manager_initialized")
-    
-    def _generate_profile_id(self, user_id: str) -> str:
-        """Generate profile ID from user ID."""
-        return f"vp_{hashlib.sha256(user_id.encode()).hexdigest()[:20]}"
-    
-    async def _extract_embedding(self, audio_data: bytes) -> Optional[List[float]]:
-        """
-        Extract voice embedding from audio using pyannote.
-        
-        Args:
-            audio_data: Audio bytes
-            
-        Returns:
-            512-dimensional embedding vector or None if extraction fails
-        """
-        try:
-            # Import speaker_id module for real embedding extraction
-            from cassandra.speaker_id import extract_embedding
-            
-            # Extract real embedding using pyannote/wespeaker
-            embedding = await extract_embedding(audio_data)
-            
-            # Convert to list for storage
-            return embedding.tolist()
-        except Exception as e:
-            logger.error("embedding_extraction_failed", error=str(e))
-            return None
-    
-    async def _calculate_quality_score(self, audio_data: bytes) -> float:
-        """
-        Calculate audio quality score based on audio characteristics.
-        
-        Args:
-            audio_data: Audio bytes
-            
-        Returns:
-            Quality score (0.0 - 1.0)
-        """
-        try:
-            import numpy as np
-            
-            # Convert bytes to numpy array (assuming 16-bit PCM)
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            
-            # Calculate audio duration in seconds (16kHz, 16-bit mono)
-            duration_sec = len(audio_array) / 16000
-            
-            # Duration score (ideal: 5-10 seconds)
-            if duration_sec < 3:
-                duration_score = 0.3
-            elif duration_sec < 5:
-                duration_score = 0.6
-            elif duration_sec <= 10:
-                duration_score = 1.0
-            else:
-                duration_score = 0.8  # Very long samples may have fatigue
-            
-            # Calculate RMS energy
-            rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
-            
-            # RMS score (ideal range: 500-5000 for 16-bit)
-            if rms < 100:
-                rms_score = 0.2  # Too quiet
-            elif rms < 500:
-                rms_score = 0.5
-            elif rms <= 5000:
-                rms_score = 1.0  # Good level
-            elif rms <= 10000:
-                rms_score = 0.7
-            else:
-                rms_score = 0.3  # Likely clipped
-            
-            # Calculate zero-crossing rate (proxy for noise)
-            zero_crossings = np.sum(np.diff(np.signbit(audio_array).astype(int)) != 0)
-            zcr = zero_crossings / len(audio_array)
-            
-            # ZCR score (speech typically 0.05-0.15)
-            if zcr < 0.02:
-                zcr_score = 0.4  # Too little variation (maybe silence)
-            elif zcr <= 0.2:
-                zcr_score = 1.0  # Good speech characteristics
-            else:
-                zcr_score = 0.5  # High noise or music
-            
-            # Combined score
-            quality_score = (duration_score * 0.4 + rms_score * 0.4 + zcr_score * 0.2)
-            
-            logger.debug("quality_score_calculated", 
-                        duration=duration_sec, 
-                        rms=float(rms), 
-                        zcr=float(zcr),
-                        score=quality_score)
-            
-            return round(quality_score, 2)
-            
-        except Exception as e:
-            logger.error("quality_calculation_failed", error=str(e))
-            return 0.5  # Default to medium quality on error
-    
-    async def enroll(self, input_data: VoiceEnrollmentInput) -> VoiceEnrollmentResult:
-        """
-        Enroll a user with voice samples.
-        
-        Args:
-            input_data: Enrollment input
-            
-        Returns:
-            Enrollment result
-        """
-        result = VoiceEnrollmentResult(success=False)
-        
-        # Validate sample count
-        num_samples = len(input_data.audio_samples)
-        
-        if num_samples < input_data.min_samples:
-            result.errors.append(
-                f"Insufficient samples: {num_samples} < {input_data.min_samples}"
-            )
-            return result
-        
-        if num_samples > input_data.max_samples:
-            result.errors.append(
-                f"Too many samples: {num_samples} > {input_data.max_samples}"
-            )
-            return result
-        
-        profile_id = self._generate_profile_id(input_data.user_id)
-        
-        logger.info(
-            "starting_enrollment",
-            user_id=input_data.user_id,
-            profile_id=profile_id,
-            sample_count=num_samples
-        )
-        
-        # Process samples
-        samples = []
-        embeddings = []
-        total_quality = 0.0
-        
-        for i, audio_data in enumerate(input_data.audio_samples):
-            # Calculate quality
-            quality = await self._calculate_quality_score(audio_data)
-            total_quality += quality
-            
-            # Extract embedding
-            embedding = await self._extract_embedding(audio_data)
-            
-            if embedding is None:
-                result.errors.append(f"Failed to extract embedding from sample {i+1}")
-                continue
-            
-            # Create sample record
-            # Use 16kHz PCM16 assumption for duration estimate
-            # (2 bytes/sample * 16000 samples/sec = 32 bytes/ms)
-            sample = VoiceSample(
-                sample_id=f"{profile_id}_sample_{i}",
-                audio_data=audio_data,
-                duration_ms=len(audio_data) // 32,
-                quality_score=quality,
-                created_at=datetime.utcnow()
-            )
-            
-            samples.append(sample)
-            embeddings.append(embedding)
-        
-        if len(embeddings) < input_data.min_samples:
-            result.errors.append("Too few valid embeddings extracted")
-            return result
-        
-        # Average embeddings
-        avg_embedding = np.mean(embeddings, axis=0).tolist()
-        
-        # Create profile
-        profile = VoiceProfile(
-            profile_id=profile_id,
-            user_id=input_data.user_id,
-            org_id=input_data.org_id,
-            embedding=avg_embedding,
-            samples=samples,
-            status=EnrollmentStatus.COMPLETED,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-            metadata={
-                "sample_count": len(samples),
-                "avg_quality": total_quality / len(samples)
-            }
-        )
-        
-        # Save to database
-        await self._save_profile(profile)
-        
-        result.success = True
-        result.profile_id = profile_id
-        result.user_id = input_data.user_id
-        result.samples_processed = len(samples)
-        result.quality_score = total_quality / len(samples)
-        result.status = EnrollmentStatus.COMPLETED
-        
-        logger.info(
-            "enrollment_completed",
-            profile_id=profile_id,
-            samples_processed=len(samples)
-        )
-        
-        return result
-    
-    async def _save_profile(self, profile: VoiceProfile):
-        """Save voice profile to database."""
-        async with self.db_pool.acquire() as conn:
-            # Save profile
-            await conn.execute(
-                """
-                INSERT INTO voice_profiles (
-                    profile_id, user_id, org_id, embedding, status,
-                    created_at, updated_at, metadata
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (profile_id) DO UPDATE SET
-                    embedding = EXCLUDED.embedding,
-                    status = EXCLUDED.status,
-                    updated_at = EXCLUDED.updated_at,
-                    metadata = EXCLUDED.metadata
-                """,
-                profile.profile_id,
-                profile.user_id,
-                profile.org_id,
-                profile.embedding,
-                profile.status.value,
-                profile.created_at,
-                profile.updated_at,
-                profile.metadata
-            )
-            
-            # Save samples
-            for sample in profile.samples:
-                await conn.execute(
-                    """
-                    INSERT INTO voice_samples (
-                        sample_id, profile_id, audio_data, duration_ms,
-                        quality_score, created_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (sample_id) DO NOTHING
-                    """,
-                    sample.sample_id,
-                    profile.profile_id,
-                    sample.audio_data,
-                    sample.duration_ms,
-                    sample.quality_score,
-                    sample.created_at
-                )
-    
-    async def verify(
-        self,
-        profile_id: str,
-        audio_sample: bytes,
-        threshold: float = 0.7
-    ) -> Dict[str, Any]:
-        """
-        Verify speaker against profile.
-        
-        Args:
-            profile_id: Profile ID to verify against
-            audio_sample: Audio sample to verify
-            threshold: Similarity threshold (0.0 - 1.0)
-            
-        Returns:
-            Verification result
-        """
-        # Get profile
-        profile = await self._get_profile(profile_id)
-        
-        if not profile:
-            return {
-                "verified": False,
-                "confidence": 0.0,
-                "error": "Profile not found"
-            }
-        
-        # Extract embedding from sample
-        sample_embedding = await self._extract_embedding(audio_sample)
-        
-        if sample_embedding is None:
-            return {
-                "verified": False,
-                "confidence": 0.0,
-                "error": "Failed to extract embedding"
-            }
-        
-        # Calculate similarity
-        similarity = self._calculate_similarity(
-            profile.embedding,
-            sample_embedding
-        )
-        
-        verified = similarity >= threshold
-        
-        return {
-            "verified": verified,
-            "confidence": similarity,
-            "threshold": threshold,
+class VoiceProfileStatusResponse(BaseModel):
+    """Response for enrollment status check."""
+    enrolled: bool
+    profile_id: Optional[str] = None
+    quality_score: Optional[float] = None
+    sample_count: int = 0
+    status: str = "inactive"
+
+
+# =============================================================================
+# Core Enrollment Logic
+# =============================================================================
+
+def _generate_profile_id(user_id: str) -> str:
+    """Generate profile ID from user ID."""
+    return f"vp_{hashlib.sha256(user_id.encode()).hexdigest()[:20]}"
+
+
+async def _extract_embedding(audio_data: bytes) -> Optional[List[float]]:
+    """Extract voice embedding from audio using pyannote."""
+    try:
+        from cassandra.speaker_id import extract_embedding
+        embedding = await extract_embedding(audio_data)
+        return embedding.tolist()
+    except Exception as e:
+        logger.error("embedding_extraction_failed", error=str(e))
+        return None
+
+
+async def _calculate_quality_score(audio_data: bytes) -> float:
+    """Calculate audio quality score based on duration, RMS, and ZCR."""
+    try:
+        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+        duration_sec = len(audio_array) / 16000
+
+        if duration_sec < 3:
+            duration_score = 0.3
+        elif duration_sec < 5:
+            duration_score = 0.6
+        elif duration_sec <= 10:
+            duration_score = 1.0
+        else:
+            duration_score = 0.8
+
+        rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+        if rms < 100:
+            rms_score = 0.2
+        elif rms < 500:
+            rms_score = 0.5
+        elif rms <= 5000:
+            rms_score = 1.0
+        elif rms <= 10000:
+            rms_score = 0.7
+        else:
+            rms_score = 0.3
+
+        zero_crossings = np.sum(np.diff(np.signbit(audio_array).astype(int)) != 0)
+        zcr = zero_crossings / len(audio_array)
+        if zcr < 0.02:
+            zcr_score = 0.4
+        elif zcr <= 0.2:
+            zcr_score = 1.0
+        else:
+            zcr_score = 0.5
+
+        return round((duration_score * 0.4 + rms_score * 0.4 + zcr_score * 0.2), 2)
+    except Exception as e:
+        logger.error("quality_calculation_failed", error=str(e))
+        return 0.5
+
+
+async def _save_profile_to_supabase(
+    profile_id: str,
+    user_id: str,
+    org_id: str,
+    embedding: List[float],
+    sample_count: int,
+    quality_score: float,
+    status: str = "active"
+) -> bool:
+    """Upsert voice profile into Supabase voice_profiles table."""
+    client = get_supabase_client("service")
+    try:
+        result = client.table("voice_profiles").upsert({
             "profile_id": profile_id,
-            "user_id": profile.user_id
-        }
-    
-    def _calculate_similarity(
-        self,
-        embedding1: List[float],
-        embedding2: List[float]
-    ) -> float:
-        """
-        Calculate cosine similarity between embeddings.
-        
-        Args:
-            embedding1: First embedding
-            embedding2: Second embedding
-            
-        Returns:
-            Similarity score (0.0 - 1.0)
-        """
-        vec1 = np.array(embedding1)
-        vec2 = np.array(embedding2)
-        
-        dot_product = np.dot(vec1, vec2)
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        
-        similarity = dot_product / (norm1 * norm2)
-        
-        # Normalize to 0-1 range
-        return (similarity + 1) / 2
-    
-    async def _get_profile(self, profile_id: str) -> Optional[VoiceProfile]:
-        """Get voice profile from database."""
-        async with self.db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM voice_profiles WHERE profile_id = $1",
-                profile_id
-            )
-            
-            if not row:
-                return None
-            
-            return VoiceProfile(
-                profile_id=row["profile_id"],
-                user_id=row["user_id"],
-                org_id=row["org_id"],
-                embedding=row["embedding"],
-                samples=[],  # Would load samples if needed
-                status=EnrollmentStatus(row["status"]),
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-                metadata=row.get("metadata", {})
-            )
-    
-    async def delete_profile(self, profile_id: str) -> bool:
-        """
-        Delete voice profile.
-        
-        Args:
-            profile_id: Profile ID to delete
-            
-        Returns:
-            True if deleted
-        """
-        async with self.db_pool.acquire() as conn:
-            # Delete samples first
-            await conn.execute(
-                "DELETE FROM voice_samples WHERE profile_id = $1",
-                profile_id
-            )
-            
-            # Delete profile
-            result = await conn.execute(
-                "DELETE FROM voice_profiles WHERE profile_id = $1",
-                profile_id
-            )
-            
-            deleted = result == "DELETE 1"
-            
-            if deleted:
-                logger.info("profile_deleted", profile_id=profile_id)
-            
-            return deleted
+            "user_id": user_id,
+            "org_id": org_id,
+            "embedding": embedding,
+            "status": status,
+            "sample_count": sample_count,
+            "quality_score": quality_score,
+            "enrolled_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "metadata": {
+                "sample_count": sample_count,
+                "avg_quality": quality_score
+            }
+        }).execute()
+        return bool(result.data)
+    except Exception as e:
+        logger.error("save_profile_failed", error=str(e))
+        return False
+
+
+async def _get_profile_from_supabase(user_id: str, org_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch voice profile for a user from Supabase."""
+    client = get_supabase_client("service")
+    result = client.table("voice_profiles").select("*").eq("user_id", user_id).eq("org_id", org_id).maybe_single().execute()
+    return result.data
 
 
 # =============================================================================
-# Database Schema
+# API Endpoints
 # =============================================================================
 
-VOICE_ENROLLMENT_SCHEMA = """
--- Voice profiles table
-CREATE TABLE IF NOT EXISTS voice_profiles (
-    profile_id VARCHAR(32) PRIMARY KEY,
-    user_id VARCHAR(32) NOT NULL,
-    org_id VARCHAR(32) NOT NULL,
-    embedding VECTOR(256),  -- Requires pgvector extension
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}',
-    
-    FOREIGN KEY (user_id) REFERENCES users(user_id),
-    FOREIGN KEY (org_id) REFERENCES organizations(org_id),
-    UNIQUE (user_id)
-);
+@router.post("", response_model=VoiceEnrollmentResponse)
+async def enroll_voice(
+    req: VoiceEnrollmentRequest,
+    user: UserContext = Depends(get_current_user)
+):
+    """
+    Enroll the current user's voice profile.
+    Upload 3-5 audio samples (5-10 seconds each) for embedding extraction.
+    """
+    user_id = user.user_id
+    org_id = user.org_id
+    num_samples = len(req.audio_samples)
 
--- Voice samples table
-CREATE TABLE IF NOT EXISTS voice_samples (
-    sample_id VARCHAR(32) PRIMARY KEY,
-    profile_id VARCHAR(32) NOT NULL,
-    audio_data BYTEA NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    quality_score FLOAT NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    
-    FOREIGN KEY (profile_id) REFERENCES voice_profiles(profile_id) ON DELETE CASCADE
-);
+    if num_samples < 1:
+        raise HTTPException(status_code=400, detail="At least 1 audio sample required")
 
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_voice_profiles_org ON voice_profiles(org_id);
-CREATE INDEX IF NOT EXISTS idx_voice_profiles_user ON voice_profiles(user_id);
-CREATE INDEX IF NOT EXISTS idx_voice_samples_profile ON voice_samples(profile_id);
-"""
+    profile_id = _generate_profile_id(user_id)
+    logger.info("starting_enrollment", user_id=user_id, profile_id=profile_id, sample_count=num_samples)
+
+    embeddings = []
+    total_quality = 0.0
+    errors = []
+
+    for i, audio_data in enumerate(req.audio_samples):
+        quality = await _calculate_quality_score(audio_data)
+        total_quality += quality
+        embedding = await _extract_embedding(audio_data)
+        if embedding is None:
+            errors.append(f"Failed to extract embedding from sample {i+1}")
+            continue
+        embeddings.append(embedding)
+
+    if not embeddings:
+        return VoiceEnrollmentResponse(success=False, errors=errors + ["No valid embeddings extracted"])
+
+    avg_embedding = np.mean(embeddings, axis=0).tolist()
+    quality_score = total_quality / len(embeddings)
+
+    saved = await _save_profile_to_supabase(
+        profile_id=profile_id,
+        user_id=user_id,
+        org_id=org_id,
+        embedding=avg_embedding,
+        sample_count=len(embeddings),
+        quality_score=quality_score,
+        status="active"
+    )
+
+    if not saved:
+        return VoiceEnrollmentResponse(success=False, errors=errors + ["Failed to save profile to database"])
+
+    logger.info("enrollment_completed", profile_id=profile_id, samples_processed=len(embeddings))
+
+    return VoiceEnrollmentResponse(
+        success=True,
+        profile_id=profile_id,
+        user_id=user_id,
+        samples_processed=len(embeddings),
+        quality_score=quality_score,
+        status="completed",
+        errors=errors
+    )
+
+
+@router.get("/status", response_model=VoiceProfileStatusResponse)
+async def get_enrollment_status(
+    user: UserContext = Depends(get_current_user)
+):
+    """Get the current user's voice enrollment status."""
+    profile = await _get_profile_from_supabase(user.user_id, user.org_id)
+    if not profile:
+        return VoiceProfileStatusResponse(enrolled=False, status="inactive")
+
+    return VoiceProfileStatusResponse(
+        enrolled=profile.get("status") == "active",
+        profile_id=profile.get("profile_id"),
+        quality_score=profile.get("quality_score"),
+        sample_count=profile.get("sample_count", 0),
+        status=profile.get("status", "inactive")
+    )
+
+
+@router.delete("", status_code=status.HTTP_200_OK)
+async def delete_enrollment(
+    user: UserContext = Depends(get_current_user)
+):
+    """Soft-delete the current user's voice enrollment (set status to inactive)."""
+    client = get_supabase_client("service")
+    result = client.table("voice_profiles").update({
+        "status": "inactive",
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("user_id", user.user_id).eq("org_id", user.org_id).execute()
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="No active voice enrollment found")
+
+    logger.info("voice_enrollment_deleted", user_id=user.user_id, org_id=user.org_id)
+    return {"deleted": True, "user_id": user.user_id}

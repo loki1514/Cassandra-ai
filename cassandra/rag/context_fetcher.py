@@ -1315,6 +1315,9 @@ async def write_session_memory(
     org_id: str,
     user_id: str | None,
     session_stats: dict,
+    room_id: str | None = None,
+    speaker_map: dict | None = None,
+    action_items: list | None = None,
 ) -> bool:
     """
     Write session summary to Supermemory after a voice session ends.
@@ -1328,6 +1331,9 @@ async def write_session_memory(
         user_id: User who owned the session (optional).
         session_stats: Session stats dict with keys like
             duration_seconds, transcript_turns, interrupts_count, tool_calls.
+        room_id: Optional room ID for room-scoped memory.
+        speaker_map: Optional mapping of speaker labels to names.
+        action_items: Optional list of extracted action items.
 
     Returns:
         True if write succeeded, False otherwise.
@@ -1348,13 +1354,24 @@ async def write_session_memory(
     interrupts = session_stats.get("interrupts_count", 0)
     tools = session_stats.get("tool_calls", 0)
 
-    memory_text = (
-        f"Voice session {session_id} summary: "
-        f"Duration {duration:.0f}s with {turns} conversation turns. "
-        f"User issued {interrupts} interrupt(s) and triggered {tools} tool call(s). "
-        f"Organization: {org_id}."
-        f" User: {user_id}." if user_id else ""
-    )
+    parts = [
+        f"Voice session {session_id} summary:",
+        f"Duration {duration:.0f}s with {turns} conversation turns.",
+        f"User issued {interrupts} interrupt(s) and triggered {tools} tool call(s).",
+        f"Organization: {org_id}.",
+    ]
+    if user_id:
+        parts.append(f"User: {user_id}.")
+    if room_id:
+        parts.append(f"Room: {room_id}.")
+    if speaker_map:
+        speakers = ", ".join([f"{k}={v['name']}" for k, v in speaker_map.items()])
+        parts.append(f"Speakers: {speakers}.")
+    if action_items:
+        items = "; ".join([f"{i['title']} (priority: {i.get('priority', 'medium')})" for i in action_items])
+        parts.append(f"Action items: {items}.")
+
+    memory_text = " ".join(parts)
 
     try:
         import httpx
@@ -1377,6 +1394,8 @@ async def write_session_memory(
                 "url": f"cassandra://session/{session_id}",
                 "org_id": org_id,
             }
+            if room_id:
+                payload["room_id"] = room_id
 
             write_url = (
                 f"{settings.supermemory.api_url.rstrip('/')}"
@@ -1389,6 +1408,7 @@ async def write_session_memory(
                 "session_memory_written",
                 session_id=session_id,
                 org_id=org_id,
+                room_id=room_id,
                 status=resp.status_code,
             )
             return True

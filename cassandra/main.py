@@ -45,6 +45,8 @@ from cassandra.rag.memory_manager import MemoryManager, MemoryEntry, MemoryPrior
 from cassandra.logging_config import LogContext, generate_trace_id
 from backend.core.session_manager import get_session_manager, SessionState
 from cassandra.supabase import get_supabase_client
+from cassandra.rooms import router as rooms_router
+from cassandra.voice_enrollment import router as voice_enroll_router
 
 # Configure structured logging
 structlog.configure(
@@ -282,6 +284,8 @@ app.include_router(voice_router)
 # =============================================================================
 from cassandra.features_router import features_router
 app.include_router(features_router)
+app.include_router(rooms_router)
+app.include_router(voice_enroll_router)
 
 
 # =============================================================================
@@ -851,6 +855,7 @@ async def websocket_audio_authenticated(
     websocket: WebSocket,
     org_id: str,
     token: str | None = None,
+    room_id: str | None = None,
 ):
     """
     Authenticated WebSocket endpoint for organization-scoped audio streaming.
@@ -861,6 +866,10 @@ async def websocket_audio_authenticated(
     2. ?token= URL param: verify HS256/RS256 JWT directly
        (legacy — for backward compatibility)
 
+    Query Params:
+        room_id: Optional room ID. If provided, loads enrolled voice profiles
+                 and triggers room-scoped post-session analysis.
+
     Sessions are tracked via SessionManager — on disconnect, the session ends
     and end-of-session callbacks fire (e.g., write session memory to Supermemory).
     """
@@ -869,11 +878,44 @@ async def websocket_audio_authenticated(
     session_manager = get_session_manager()
     session_id = f"ws-{org_id}-{int(time.time())}"
 
+    # Room context (loaded after auth)
+    room_context: dict | None = None
+    room_db_id: str | None = None
+
+    # Accumulate full session audio for post-room analysis
+    session_recording: list[bytes] = []
+
     # Build the end-of-session callback (fires during session cleanup)
     async def _on_session_end(
         sess_id: str, sess_org_id: str, sess_user_id: str | None, stats: dict
     ) -> None:
         """Write session summary memory to Supermemory after session ends."""
+        # Trigger room-scoped post-session analysis if room was bound
+        if room_context and room_db_id:
+            full_audio = b"".join(session_recording)
+            try:
+                from cassandra.post_session_analyzer import run_room_analysis
+                asyncio.create_task(
+                    run_room_analysis(
+                        room_db_id=room_db_id,
+                        session_id=sess_id,
+                        org_id=sess_org_id,
+                        full_audio=full_audio,
+                    )
+                )
+                logger.info(
+                    "room_analysis_triggered",
+                    session_id=sess_id,
+                    room_id=room_context.get("room_id"),
+                    audio_bytes=len(full_audio),
+                )
+            except Exception as e:
+                logger.error(
+                    "room_analysis_trigger_failed",
+                    session_id=sess_id,
+                    error=str(e),
+                )
+
         if not settings.supermemory.is_configured:
             logger.debug(
                 "supermemory_not_configured_skip_memory_write",
@@ -887,6 +929,7 @@ async def websocket_audio_authenticated(
                 org_id=sess_org_id,
                 user_id=sess_user_id,
                 session_stats=stats,
+                room_id=room_context.get("room_id") if room_context else None,
             )
         except Exception as e:
             logger.error(
@@ -946,6 +989,52 @@ async def websocket_audio_authenticated(
             await websocket.close(code=4001, reason="Authentication failed")
             return
 
+    # ── Validate & load room context ──────────────────────────────────────────
+    if room_id:
+        try:
+            supabase = get_supabase_client("service")
+            room_result = (
+                supabase.table("rooms")
+                .select("*")
+                .eq("room_id", room_id)
+                .eq("org_id", org_id)
+                .maybe_single()
+                .execute()
+            )
+            if not room_result.data:
+                await websocket.close(code=4004, reason="Room not found")
+                return
+            room_context = room_result.data
+            room_db_id = room_context["id"]
+
+            # Fetch voice profile embeddings for room participants
+            participants = room_context.get("participants", [])
+            participant_embeddings = {}
+            if participants:
+                user_ids = [p["user_id"] for p in participants if p.get("user_id")]
+                vp_result = (
+                    supabase.table("voice_profiles")
+                    .select("user_id, embedding")
+                    .in_("user_id", user_ids)
+                    .eq("org_id", org_id)
+                    .eq("status", "active")
+                    .execute()
+                )
+                for vp in vp_result.data:
+                    participant_embeddings[vp["user_id"]] = vp["embedding"]
+
+            logger.info(
+                "room_bound_to_websocket",
+                room_id=room_id,
+                session_id=session_id,
+                participant_count=len(participants),
+                embedding_count=len(participant_embeddings),
+            )
+        except Exception as e:
+            logger.error("room_lookup_failed", room_id=room_id, error=str(e))
+            await websocket.close(code=4004, reason="Room validation failed")
+            return
+
     # ── Register connection and enter session ─────────────────────────────────
     await websocket.accept()
     client_id = f"ws_auth_{id(websocket)}_{int(time.time())}"
@@ -958,8 +1047,23 @@ async def websocket_audio_authenticated(
         "client_id": client_id,
         "session_id": session_id,
         "org_id": org_id,
+        "room_id": room_id,
         "message": "Authenticated. Send PCM16 audio data.",
     })
+
+    # ── Greeting TTS (agent speaks first) ─────────────────────────────────────
+    greeting = "Hello, I'm Cassandra. How can I help you today?"
+    try:
+        tts = ElevenLabsTTS()
+        greeting_audio = await tts.generate_speech(greeting)
+        await websocket.send_bytes(greeting_audio)
+        logger.debug("greeting_tts_sent", session_id=session_id, audio_size=len(greeting_audio))
+    except Exception as tts_error:
+        logger.warning("greeting_tts_failed", error=str(tts_error))
+        await websocket.send_text(json.dumps({
+            "type": "voice_response",
+            "text": greeting
+        }))
 
     # Enter session context — end_session() + callbacks fire on exit
     async with session_manager.create_session(
@@ -970,12 +1074,19 @@ async def websocket_audio_authenticated(
     ) as session_ctx:
         session_ctx.add_end_callback(_on_session_end)
 
+        # Attach room metadata to session context for downstream use
+        if room_context:
+            setattr(session_ctx, "room_id", room_context.get("room_id"))
+            setattr(session_ctx, "property_id", room_context.get("property_id"))
+            setattr(session_ctx, "participant_embeddings", participant_embeddings)
+
         while True:
             try:
                 message = await websocket.receive()
 
                 if "bytes" in message:
                     audio_data = message["bytes"]
+                    session_recording.append(audio_data)
                     session_ctx.audio_chunks_received += 1
 
                     if session_ctx.state == SessionState.IDLE:
