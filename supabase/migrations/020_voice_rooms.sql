@@ -8,6 +8,12 @@
 --   M-5:  composite index on (room_id, start_ms) for enriched_transcripts
 --   M-6:  partial index on rooms.active_session_id for fast lookups
 
+-- Hotfix: legacy backend/infrastructure migrations reference user_orgs in RLS policies
+-- but never created the table. We create it as a view on users so those policies work.
+CREATE OR REPLACE VIEW user_orgs AS
+SELECT id AS user_id, org_id
+FROM users;
+
 -- ============================================
 -- 1. VOICE PROFILES (org-scoped enrollment)
 -- ============================================
