@@ -147,7 +147,48 @@ CREATE INDEX idx_action_items_assignee_id ON action_items(assignee_id);
 CREATE INDEX idx_action_items_status ON action_items(status);
 
 -- ============================================
--- 5. ROW LEVEL SECURITY (H-1 fix)
+-- 5. SPEAKER ANALYSIS AUDIT (mapping quality tracking)
+-- ============================================
+-- Tracks how reliable the speaker attribution was for each room.
+-- Used to flag results that require human review and to detect systematic drift.
+CREATE TABLE IF NOT EXISTS speaker_analysis_audit (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    room_id UUID NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    org_id UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+    session_id TEXT,
+
+    -- Mapping quality counters
+    pyannote_speakers INT DEFAULT 0,    -- unique Pyannote labels found (SPEAKER_00...)
+    assemblyai_speakers INT DEFAULT 0,   -- unique AssemblyAI labels found (A, B, C...)
+    overlap_matched INT DEFAULT 0,         -- segments matched by time overlap
+    unmatched_speakers INT DEFAULT 0,    -- speakers with 0.0 confidence
+
+    -- Confidence scores
+    mapping_confidence_avg FLOAT DEFAULT 0.0,  -- avg cosine similarity of matched speakers
+    mapping_confidence_min FLOAT DEFAULT 0.0,  -- lowest match score (weakest link)
+    high_confidence_matches INT DEFAULT 0,  -- matches >= 0.85
+
+    -- Derived flags
+    has_unknowns BOOLEAN DEFAULT FALSE,   -- True if any speaker had 0.0 confidence
+    requires_review BOOLEAN GENERATED ALWAYS AS (
+        has_unknowns
+        OR mapping_confidence_avg < 0.60
+        OR (mapping_confidence_min > 0.0 AND mapping_confidence_min < 0.50)
+    ) STORED,
+
+    -- Low-confidence speakers for quick review
+    unknown_speaker_labels TEXT[],  -- Pyannote labels that didn't match anyone
+
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_speaker_analysis_audit_room_id ON speaker_analysis_audit(room_id);
+CREATE INDEX idx_speaker_analysis_audit_org_id ON speaker_analysis_audit(org_id);
+CREATE INDEX idx_speaker_analysis_audit_requires_review ON speaker_analysis_audit(requires_review)
+    WHERE requires_review = TRUE;
+
+-- ============================================
+-- 6. ROW LEVEL SECURITY (H-1 fix)
 -- ============================================
 -- Enable RLS on all 4 new tables
 ALTER TABLE voice_profiles ENABLE ROW LEVEL SECURITY;
@@ -222,5 +263,18 @@ CREATE POLICY "org_action_items_insert" ON action_items
     );
 CREATE POLICY "org_action_items_update" ON action_items
     FOR UPDATE USING (
+        org_id = (SELECT org_id FROM users WHERE id = auth.uid())
+    );
+
+-- ── speaker_analysis_audit ────────────────────────────────────────────────
+-- Tracks mapping quality for each room's post-session analysis.
+-- Needs service role for writes (written by post_session_analyzer).
+-- Read access is org-scoped so users can see quality flags.
+ALTER TABLE speaker_analysis_audit ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "service_role_all_speaker_analysis_audit" ON speaker_analysis_audit
+    FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "org_speaker_analysis_audit_select" ON speaker_analysis_audit
+    FOR SELECT USING (
         org_id = (SELECT org_id FROM users WHERE id = auth.uid())
     );

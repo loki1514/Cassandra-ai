@@ -326,10 +326,39 @@ async def get_room_analysis(
     # Fetch action items
     action_result = client.table("action_items").select("*").eq("room_id", room["id"]).order("created_at", desc=False).execute()
 
+    # Fetch speaker analysis audit for quality flags
+    audit_result = client.table("speaker_analysis_audit").select("*").eq("room_id", room["id"]).maybe_single().execute()
+    audit = audit_result.data if audit_result.data else None
+
+    # Determine if human review is recommended
+    review_required = False
+    review_reason: str | None = None
+    if audit:
+        if audit.get("has_unknowns"):
+            review_required = True
+            review_reason = "unidentified_speakers"
+        elif (audit.get("mapping_confidence_avg") or 1.0) < 0.60:
+            review_required = True
+            review_reason = "low_mapping_confidence"
+        elif audit.get("unmatched_speakers", 0) > 0:
+            review_required = True
+            review_reason = "partial_match"
+
     return {
         "room_id": room_id,
         "status": room.get("analysis_status", "pending"),
         "speaker_map": room.get("analysis_result", {}).get("speaker_map", {}),
         "enriched_transcript": transcript_result.data,
         "action_items": action_result.data,
+        # Audit quality flags: tell the caller whether to trust these results
+        "review_required": review_required,
+        "review_reason": review_reason,
+        "mapping_quality": {
+            "pyannote_speakers": audit.get("pyannote_speakers") if audit else None,
+            "assemblyai_speakers": audit.get("assemblyai_speakers") if audit else None,
+            "unmatched_speakers": audit.get("unmatched_speakers") if audit else None,
+            "avg_confidence": audit.get("mapping_confidence_avg") if audit else None,
+            "high_confidence_matches": audit.get("high_confidence_matches") if audit else None,
+            "unknown_labels": audit.get("unknown_speaker_labels") if audit else None,
+        } if audit else None,
     }

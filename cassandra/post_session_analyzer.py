@@ -265,6 +265,40 @@ async def run_room_analysis(
 
     logger.info("speaker_map_built", labels=list(speaker_map.keys()))
 
+    # ── Step 4b: Compute audit stats and write audit record ─────────────────
+    # Computes mapping quality metrics so callers know whether to trust results.
+    pyannote_labels = set(label_segments.keys())
+    unknown_labels = [lbl for lbl, info in speaker_map.items() if info["confidence"] == 0.0]
+    matched_labels = [lbl for lbl, info in speaker_map.items() if info["confidence"] > 0.0]
+    confidences = [info["confidence"] for info in speaker_map.values() if info["confidence"] > 0.0]
+
+    audit_record = {
+        "room_id": room_db_id,
+        "org_id": org_id,
+        "session_id": session_id,
+        "pyannote_speakers": len(pyannote_labels),
+        "assemblyai_speakers": 0,  # populated after AAI transcription
+        "overlap_matched": len(matched_labels),
+        "unmatched_speakers": len(unknown_labels),
+        "mapping_confidence_avg": round(sum(confidences) / len(confidences), 4) if confidences else 0.0,
+        "mapping_confidence_min": round(min(confidences), 4) if confidences else 0.0,
+        "high_confidence_matches": sum(1 for c in confidences if c >= 0.85),
+        "has_unknowns": len(unknown_labels) > 0,
+        "unknown_speaker_labels": unknown_labels,
+    }
+    try:
+        client.table("speaker_analysis_audit").insert(audit_record).execute()
+        logger.info(
+            "speaker_audit_recorded",
+            room_id=room_db_id,
+            pyannote_speakers=audit_record["pyannote_speakers"],
+            unmatched=audit_record["unmatched_speakers"],
+            avg_confidence=audit_record["mapping_confidence_avg"],
+            requires_review=audit_record["has_unknowns"] or audit_record["mapping_confidence_avg"] < 0.60,
+        )
+    except Exception as e:
+        logger.warning("speaker_audit_record_failed", room_id=room_db_id, error=str(e))
+
     # Build Pyannote segment index keyed by label for overlap lookup
     # CR-3 fix: Pyannote labels (SPEAKER_00/01/02) and AssemblyAI labels
     # (A/B/C) are independent numbering systems. We match by time overlap
@@ -294,6 +328,15 @@ async def run_room_analysis(
     except Exception as e:
         logger.error("transcription_failed", error=str(e))
         aai_segments = []
+
+    # Update audit record with AAI speaker count
+    try:
+        aai_speaker_count = len(set(s.speaker_label for s in aai_segments))
+        client.table("speaker_analysis_audit").update({
+            "assemblyai_speakers": aai_speaker_count,
+        }).eq("room_id", room_db_id).eq("org_id", org_id).execute()
+    except Exception as e:
+        logger.warning("audit_assemblyai_count_update_failed", room_id=room_db_id, error=str(e))
 
     # Build enriched transcript segments
     # CR-3 fix: match AssemblyAI segments to Pyannote labels via time overlap,

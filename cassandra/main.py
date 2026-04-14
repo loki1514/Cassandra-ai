@@ -36,6 +36,33 @@ import structlog
 # garbage collector does not cancel them prematurely.
 _pending_analysis_tasks: set[asyncio.Task] = set()
 
+
+# ── Audio Format Validation ──────────────────────────────────────────────────
+# Audio format contract: PCM16 little-endian mono 16kHz.
+# If a client sends wrong format, _validate_audio_chunk rejects it early
+# instead of producing garbage in Pyannote embeddings and AssemblyAI transcripts.
+BYTES_PER_100MS = 3200  # 16000 Hz * 2 bytes/sample * 100ms
+
+
+def _validate_audio_chunk(chunk: bytes) -> bool:
+    """
+    Validate that an audio chunk conforms to the PCM16 mono 16kHz contract.
+
+    Reject chunks that are too small (likely silence/keepalive) or too large
+    (likely wrong sample rate or bit depth). Log and skip invalid chunks so they
+    don't corrupt downstream processing.
+    """
+    size = len(chunk)
+    # Too small: less than 50ms of audio at expected format.
+    # These are keepalive/ping packets, not real audio.
+    if size < BYTES_PER_100MS // 2:
+        return False
+    # Too large: more than 5 seconds of audio in one WebSocket frame.
+    # Almost certainly wrong sample rate (e.g., 48kHz = 3x the expected size).
+    if size > BYTES_PER_100MS * 50:
+        return False
+    return True
+
 from cassandra.config import settings, get_settings
 from cassandra.auth import (
     verify_jwt, get_current_user, UserContext,
@@ -1087,6 +1114,15 @@ async def websocket_audio_authenticated(
         "org_id": org_id,
         "room_id": room_id,
         "message": "Authenticated. Send PCM16 audio data.",
+        # Audio format contract: client must send PCM16 mono 16kHz.
+        # Any other format produces garbage in post-session analysis.
+        "required_audio_format": {
+            "encoding": "PCM16",
+            "sample_rate": 16000,
+            "channels": 1,
+            "bit_depth": 16,
+            "expected_bytes_per_100ms": 3200,
+        },
     })
 
     # Enter session context — end_session() + callbacks fire on exit
@@ -1147,6 +1183,18 @@ async def websocket_audio_authenticated(
 
                 if "bytes" in message:
                     audio_data = message["bytes"]
+
+                    # Audio format guard: reject chunks that don't match PCM16 mono 16kHz.
+                    # Invalid chunks are skipped rather than accumulated to prevent
+                    # garbage from corrupting post-session Pyannote analysis.
+                    if not _validate_audio_chunk(audio_data):
+                        logger.debug(
+                            "invalid_audio_chunk_skipped",
+                            size=len(audio_data),
+                            session_id=session_id,
+                        )
+                        continue
+
                     session_recording.append(audio_data)
                     session_ctx.audio_chunks_received += 1
 
