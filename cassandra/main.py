@@ -262,6 +262,19 @@ class ConnectionManager:
 # Global connection manager instance
 manager = ConnectionManager()
 
+# =============================================================================
+# Shared TTS instance (avoid recreating HTTP client per segment)
+# =============================================================================
+_tts_instance: Optional[ElevenLabsTTS] = None
+
+
+def _get_tts() -> ElevenLabsTTS:
+    """Get or create cached ElevenLabs TTS instance."""
+    global _tts_instance
+    if _tts_instance is None:
+        _tts_instance = ElevenLabsTTS()
+    return _tts_instance
+
 
 # =============================================================================
 # Lifespan Events
@@ -297,7 +310,7 @@ app = FastAPI(
 if settings.security.enable_cors:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.security.allowed_origins,
+        allow_origins=settings.security.allowed_origins_list,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -515,57 +528,79 @@ async def process_voice_to_ticket(
                 has_description=bool(extracted.get("description"))
             )
             
-            # Step 3: Create ticket if requested and data extracted
+            # Step 3: Create actual ticket in Supabase if requested and data extracted
+            ticket_db_id: Optional[str] = None
             if create_ticket and extracted.get("title"):
                 try:
-                    # This would use the actual db_pool in production
-                    ticket_input = CreateTicketInput(
-                        title=extracted["title"],
-                        description=extracted.get("description"),
-                        priority=extracted.get("priority", TicketPriority.MEDIUM),
-                        requester_email=extracted.get("requester_email"),
-                        tags=extracted.get("tags", []),
-                        source="voice"
+                    supabase = get_supabase_client("service")
+                    ticket_insert = (
+                        supabase.table("tickets")
+                        .insert({
+                            "org_id": org_id,
+                            "title": extracted["title"][:500],
+                            "description": extracted.get("description", "")[:10000] or None,
+                            "status": "open",
+                            "priority": extracted.get("priority", "medium"),
+                            "category": extracted.get("category"),
+                            "created_at": datetime.utcnow().isoformat(),
+                            "updated_at": datetime.utcnow().isoformat(),
+                        })
+                        .execute()
                     )
-                    
-                    # Mock ticket creation (would use actual tool in production)
-                    ticket_result = {
-                        "ticket_id": f"TICKET-{trace_id[:8].upper()}",
-                        "title": ticket_input.title,
-                        "priority": ticket_input.priority.value,
-                        "created_at": datetime.utcnow().isoformat()
-                    }
-                    
-                    result.tickets_created.append(ticket_result)
-                    
-                    logger.info(
-                        "ticket_created",
-                        ticket_id=ticket_result["ticket_id"],
-                        title=ticket_result["title"]
-                    )
-                    
+                    if ticket_insert.data:
+                        ticket_db_id = ticket_insert.data[0].get("id")
+                        ticket_result = {
+                            "ticket_id": ticket_db_id,
+                            "title": extracted["title"],
+                            "priority": extracted.get("priority", "medium"),
+                            "created_at": datetime.utcnow().isoformat(),
+                        }
+                        result.tickets_created.append(ticket_result)
+                        logger.info(
+                            "ticket_created_in_supabase",
+                            ticket_id=ticket_db_id,
+                            org_id=org_id,
+                            title=extracted["title"][:50],
+                        )
+                    else:
+                        logger.warning("ticket_insert_no_data", org_id=org_id)
                 except Exception as e:
                     error_msg = f"Ticket creation failed: {str(e)}"
                     logger.error("ticket_creation_failed", error=error_msg)
                     result.errors.append(error_msg)
             
-            # Step 4: Add to memory if requested
+            # Step 4: Add to memory_archive if requested
             if add_memory and transcript_text:
                 try:
-                    memory_result = {
-                        "memory_id": f"mem_{trace_id[:12]}",
-                        "content_preview": transcript_text[:100] + "...",
-                        "ticket_id": result.tickets_created[0]["ticket_id"] if result.tickets_created else None,
-                        "created_at": datetime.utcnow().isoformat()
+                    supabase = get_supabase_client("service")
+                    memory_payload = {
+                        "org_id": org_id,
+                        "entity_id": ticket_db_id or f"voice-{trace_id}",
+                        "entity_type": "memory",
+                        "original_data": {
+                            "transcript": transcript_text,
+                            "extracted": extracted,
+                            "source": "api_voice_process",
+                        },
+                        "metadata": {
+                            "source": "api_voice_process",
+                            "ticket_created": ticket_db_id is not None,
+                        },
+                        "archived_at": datetime.utcnow().isoformat(),
                     }
-                    
-                    result.memories_linked.append(memory_result)
-                    
-                    logger.info(
-                        "memory_added",
-                        memory_id=memory_result["memory_id"]
+                    mem_insert = supabase.table("memory_archive").insert(memory_payload).execute()
+                    memory_id = (
+                        mem_insert.data[0].get("id")
+                        if mem_insert.data else f"mem-{trace_id[:12]}"
                     )
-                    
+                    memory_result = {
+                        "memory_id": memory_id,
+                        "content_preview": transcript_text[:100] + "...",
+                        "ticket_id": ticket_db_id,
+                        "created_at": datetime.utcnow().isoformat(),
+                    }
+                    result.memories_linked.append(memory_result)
+                    logger.info("memory_added", memory_id=memory_id)
                 except Exception as e:
                     error_msg = f"Memory add failed: {str(e)}"
                     logger.error("memory_add_failed", error=error_msg)
@@ -748,18 +783,21 @@ async def _process_audio_segment(
     segment: bytes,
     org_id: str,
     user_id: str,
-    segment_number: int
+    segment_number: int,
+    session_id: Optional[str] = None,
 ) -> tuple[Dict[str, Any], Optional[bytes]]:
     """
     Process a completed audio segment through the full pipeline.
 
-    Pipeline: transcribe → extract ticket data → generate voice response (TTS).
+    Pipeline: transcribe → extract ticket data → create ticket in Supabase
+    → write memory archive → generate voice response (TTS).
 
     Args:
         segment: Raw PCM16 audio bytes
         org_id: Organization ID for scoping
         user_id: User ID for audit
         segment_number: Segment counter for tracking
+        session_id: Optional Cassandra session ID for transcript/memory linkage
 
     Returns:
         Tuple of (result_dict, audio_bytes).
@@ -770,7 +808,7 @@ async def _process_audio_segment(
     audio_bytes: Optional[bytes] = None
 
     try:
-        # Step 1: Transcribe
+        # Step 1: Transcribe (AssemblyAI — already real)
         segments = await transcribe(segment, org_id=org_id)
         result.segments = [
             {
@@ -785,24 +823,84 @@ async def _process_audio_segment(
         transcript_text = " ".join([seg.text for seg in segments])
         result.transcript = transcript_text
 
-        # Step 2: Extract ticket data
+        # Step 2: Extract ticket data (OpenAI LLM — already real)
         extracted = await extract_ticket_data(transcript_text, speaker_context=None)
         result.extracted_data = extracted
 
-        # Step 3: Create ticket if actionable data found
+        # Step 3: Create actual ticket in Supabase if actionable data found
+        ticket_db_id: Optional[str] = None
         if extracted.get("title"):
-            ticket_result = {
-                "ticket_id": f"TICKET-{trace_id[:8].upper()}",
-                "title": extracted["title"],
-                "priority": extracted.get("priority", "medium"),
-                "created_at": datetime.utcnow().isoformat()
-            }
-            result.tickets_created.append(ticket_result)
+            try:
+                supabase = get_supabase_client("service")
+                ticket_insert = (
+                    supabase.table("tickets")
+                    .insert({
+                        "org_id": org_id,
+                        "title": extracted["title"][:500],
+                        "description": extracted.get("description", "")[:10000] or None,
+                        "status": "open",
+                        "priority": extracted.get("priority", "medium"),
+                        "category": extracted.get("category"),
+                        "created_at": datetime.utcnow().isoformat(),
+                        "updated_at": datetime.utcnow().isoformat(),
+                    })
+                    .execute()
+                )
+                if ticket_insert.data:
+                    ticket_db_id = ticket_insert.data[0].get("id")
+                    ticket_result = {
+                        "ticket_id": ticket_db_id,
+                        "title": extracted["title"],
+                        "priority": extracted.get("priority", "medium"),
+                        "created_at": datetime.utcnow().isoformat(),
+                    }
+                    result.tickets_created.append(ticket_result)
+                    logger.info(
+                        "ticket_created_in_supabase",
+                        ticket_id=ticket_db_id,
+                        org_id=org_id,
+                        title=extracted["title"][:50],
+                    )
+                else:
+                    logger.warning("ticket_insert_no_data", org_id=org_id)
+            except Exception as db_err:
+                logger.error(
+                    "ticket_creation_supabase_failed",
+                    org_id=org_id,
+                    error=str(db_err),
+                )
+                # Pipeline continues — transcript and TTS still delivered
 
-        # Step 4: Generate voice response (TTS)
+        # Step 4: Write transcript/memory to memory_archive
+        try:
+            supabase = get_supabase_client("service")
+            memory_payload = {
+                "org_id": org_id,
+                "entity_id": ticket_db_id or f"session-{trace_id}",
+                "entity_type": "memory",
+                "original_data": {
+                    "transcript": transcript_text,
+                    "extracted": extracted,
+                    "segment_number": segment_number,
+                    "session_id": session_id,
+                },
+                "metadata": {
+                    "source": "voice_pipeline",
+                    "segment_number": segment_number,
+                    "speaker_count": len({s.speaker_label for s in segments}),
+                },
+                "archived_at": datetime.utcnow().isoformat(),
+            }
+            supabase.table("memory_archive").insert(memory_payload).execute()
+            logger.debug("memory_archive_written", trace_id=trace_id, org_id=org_id)
+        except Exception as mem_err:
+            logger.warning("memory_archive_write_failed", error=str(mem_err))
+            # Non-blocking — pipeline continues
+
+        # Step 5: Generate voice response (ElevenLabs TTS — already real)
         response_text = _build_voice_response(transcript_text, extracted, result.tickets_created)
         try:
-            tts = ElevenLabsTTS()
+            tts = _get_tts()
             audio_bytes = await tts.generate_speech(response_text)
             logger.debug(
                 "tts_audio_generated",
@@ -871,7 +969,7 @@ def _build_voice_response(
     return "I'm listening."
 
 
-def _process_audio_segment_legacy(
+async def _process_audio_segment_legacy(
     segment: bytes,
     org_id: str,
     user_id: str,
@@ -881,7 +979,7 @@ def _process_audio_segment_legacy(
     Legacy version — returns only result dict, no audio.
     Kept for backwards compatibility with any code that calls this directly.
     """
-    result, _ = _process_audio_segment(segment, org_id, user_id, segment_number)
+    result, _ = await _process_audio_segment(segment, org_id, user_id, segment_number)
     return result
 
 
@@ -1163,16 +1261,20 @@ async def websocket_audio_authenticated(
         # Fires inside session context so failure cannot orphan the session.
         greeting = "Hello, I'm Cassandra. How can I help you today?"
         try:
-            tts = ElevenLabsTTS()
+            tts = _get_tts()
             greeting_audio = await tts.generate_speech(greeting)
             await websocket.send_bytes(greeting_audio)
             logger.debug("greeting_tts_sent", session_id=session_id, audio_size=len(greeting_audio))
         except Exception as tts_error:
             logger.warning("greeting_tts_failed", error=str(tts_error))
-            await websocket.send_text(json.dumps({
-                "type": "voice_response",
-                "text": greeting
-            }))
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": "voice_response",
+                    "text": greeting
+                }))
+            except Exception:
+                # Connection already dead — swallow and continue to main loop
+                pass
 
         # Attach room metadata to session context for downstream use
         if room_context:
@@ -1180,114 +1282,126 @@ async def websocket_audio_authenticated(
             setattr(session_ctx, "property_id", room_context.get("property_id"))
             setattr(session_ctx, "participant_embeddings", participant_embeddings)
 
-        while True:
-            try:
-                message = await websocket.receive()
+        # ── Main message loop with graceful error handling ─────────────────────
+        # The outer try/finally guarantees ConnectionManager cleanup even if
+        # an unhandled exception escapes the inner error handler.
+        try:
+            while True:
+                try:
+                    message = await websocket.receive()
 
-                if "bytes" in message:
-                    audio_data = message["bytes"]
+                    if "bytes" in message:
+                        audio_data = message["bytes"]
 
-                    # Audio format guard: reject chunks that don't match PCM16 mono 16kHz.
-                    # Invalid chunks are skipped rather than accumulated to prevent
-                    # garbage from corrupting post-session Pyannote analysis.
-                    if not _validate_audio_chunk(audio_data):
-                        logger.debug(
-                            "invalid_audio_chunk_skipped",
-                            size=len(audio_data),
-                            session_id=session_id,
-                        )
-                        continue
+                        # Audio format guard: reject chunks that don't match PCM16 mono 16kHz.
+                        # Invalid chunks are skipped rather than accumulated to prevent
+                        # garbage from corrupting post-session Pyannote analysis.
+                        if not _validate_audio_chunk(audio_data):
+                            logger.debug(
+                                "invalid_audio_chunk_skipped",
+                                size=len(audio_data),
+                                session_id=session_id,
+                            )
+                            continue
 
-                    session_recording.append(audio_data)
-                    session_ctx.audio_chunks_received += 1
+                        session_recording.append(audio_data)
+                        session_ctx.audio_chunks_received += 1
 
-                    if session_ctx.state == SessionState.IDLE:
-                        session_ctx.transition_to(SessionState.LISTENING)
-
-                    segment = buffer_manager.add_audio(audio_data)
-
-                    if segment:
-                        segment_count += 1
-                        session_ctx.transcript_turns += 1
-                        session_ctx.transition_to(SessionState.PROCESSING)
-
-                        await manager.send_json(client_id, {
-                            "type": "segment",
-                            "audio_length": len(segment),
-                            "duration_ms": buffer_manager.get_duration_ms(),
-                            "segment_number": segment_count,
-                        })
-
-                        pipeline_result, audio_bytes = await _process_audio_segment(
-                            segment, org_id, ws_user_id, segment_count
-                        )
-                        await manager.send_json(client_id, {
-                            "type": "pipeline_result",
-                            "data": pipeline_result,
-                        })
-
-                        if audio_bytes:
-                            session_ctx.transition_to(SessionState.SPEAKING)
-                            await websocket.send_bytes(audio_bytes)
-                            await manager.send_json(client_id, {
-                                "type": "voice_response",
-                                "audio_length": len(audio_bytes),
-                                "text": pipeline_result.get("transcript", ""),
-                            })
-                            session_ctx.transition_to(SessionState.LISTENING)
-                        else:
+                        if session_ctx.state == SessionState.IDLE:
                             session_ctx.transition_to(SessionState.LISTENING)
 
-                        buffer_manager.reset()
+                        segment = buffer_manager.add_audio(audio_data)
 
-                elif "text" in message:
-                    try:
-                        control = json.loads(message["text"])
-                        action = control.get("action")
+                        if segment:
+                            segment_count += 1
+                            session_ctx.transcript_turns += 1
+                            session_ctx.transition_to(SessionState.PROCESSING)
 
-                        if action == "status":
                             await manager.send_json(client_id, {
-                                "type": "status",
-                                "buffer_duration_ms": buffer_manager.get_duration_ms(),
-                                "segment_count": segment_count,
-                                "session_state": session_ctx.state.value,
+                                "type": "segment",
+                                "audio_length": len(segment),
+                                "duration_ms": buffer_manager.get_duration_ms(),
+                                "segment_number": segment_count,
                             })
-                        elif action == "interrupt":
-                            if session_ctx.state == SessionState.SPEAKING:
-                                session_ctx.transition_to(SessionState.LISTENING)
-                                session_ctx.audio_buffer.reset()
+
+                            pipeline_result, audio_bytes = await _process_audio_segment(
+                                segment, org_id, ws_user_id, segment_count, session_id=session_id
+                            )
+                            await manager.send_json(client_id, {
+                                "type": "pipeline_result",
+                                "data": pipeline_result,
+                            })
+
+                            if audio_bytes:
+                                session_ctx.transition_to(SessionState.SPEAKING)
+                                await websocket.send_bytes(audio_bytes)
                                 await manager.send_json(client_id, {
-                                    "type": "interrupt",
-                                    "message": "Interrupted",
+                                    "type": "voice_response",
+                                    "audio_length": len(audio_bytes),
+                                    "text": pipeline_result.get("transcript", ""),
                                 })
-                    except json.JSONDecodeError:
+                                session_ctx.transition_to(SessionState.LISTENING)
+                            else:
+                                session_ctx.transition_to(SessionState.LISTENING)
+
+                            buffer_manager.reset()
+
+                    elif "text" in message:
+                        try:
+                            control = json.loads(message["text"])
+                            action = control.get("action")
+
+                            if action == "status":
+                                await manager.send_json(client_id, {
+                                    "type": "status",
+                                    "buffer_duration_ms": buffer_manager.get_duration_ms(),
+                                    "segment_count": segment_count,
+                                    "session_state": session_ctx.state.value,
+                                })
+                            elif action == "interrupt":
+                                if session_ctx.state == SessionState.SPEAKING:
+                                    session_ctx.transition_to(SessionState.LISTENING)
+                                    session_ctx.audio_buffer.reset()
+                                    await manager.send_json(client_id, {
+                                        "type": "interrupt",
+                                        "message": "Interrupted",
+                                    })
+                        except json.JSONDecodeError:
+                            await manager.send_json(client_id, {
+                                "type": "error",
+                                "message": "Invalid JSON control message",
+                            })
+
+                except WebSocketDisconnect:
+                    break
+                except Exception as e:
+                    logger.error(
+                        "websocket_error",
+                        client_id=client_id,
+                        session_id=session_id,
+                        error_type=type(e).__name__,
+                        error_message=str(e),
+                    )
+                    # CRITICAL FIX: Don't let a dead socket crash the session.
+                    # If send_json fails here, swallow it so the loop can continue
+                    # or break cleanly on the next iteration.
+                    try:
                         await manager.send_json(client_id, {
                             "type": "error",
-                            "message": "Invalid JSON control message",
+                            "message": "Internal error occurred",
                         })
+                    except Exception:
+                        pass
 
-            except WebSocketDisconnect:
-                break
-            except Exception as e:
-                logger.error(
-                    "websocket_error",
-                    client_id=client_id,
-                    session_id=session_id,
-                    error_type=type(e).__name__,
-                    error_message=str(e),
-                )
-                await manager.send_json(client_id, {
-                    "type": "error",
-                    "message": "Internal error occurred",
-                })
-
-        logger.info(
-            "websocket_disconnected",
-            session_id=session_id,
-            client_id=client_id,
-        )
-
-    manager.disconnect(client_id)
+            logger.info(
+                "websocket_disconnected",
+                session_id=session_id,
+                client_id=client_id,
+            )
+        finally:
+            # CRITICAL FIX: Always run disconnect, even if an unhandled exception
+            # escapes the inner error handler or the session context manager.
+            manager.disconnect(client_id)
 
 
 # =============================================================================

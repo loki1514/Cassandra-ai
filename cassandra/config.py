@@ -272,19 +272,18 @@ class SecuritySettings(BaseSettings):
     jwt_refresh_expiration_days: int = Field(default=7, description="Refresh token expiration")
     password_min_length: int = Field(default=8, description="Minimum password length")
     enable_cors: bool = Field(default=True, description="Enable CORS")
-    allowed_origins: List[str] = Field(
-        default_factory=list,
-        description="Allowed CORS origins"
+    allowed_origins: str = Field(
+        default="",
+        description="Allowed CORS origins as comma-separated string"
     )
     encryption_enabled: bool = Field(default=True, description="Enable KMS encryption")
     
-    @field_validator('allowed_origins', mode='before')
-    @classmethod
-    def parse_origins(cls, v):
-        """Parse comma-separated origins."""
-        if isinstance(v, str):
-            return [origin.strip() for origin in v.split(',') if origin.strip()]
-        return v
+    @property
+    def allowed_origins_list(self) -> List[str]:
+        """Parse comma-separated origins into a list."""
+        if not self.allowed_origins:
+            return []
+        return [origin.strip() for origin in self.allowed_origins.split(',') if origin.strip()]
 
 
 class LoggingSettings(BaseSettings):
